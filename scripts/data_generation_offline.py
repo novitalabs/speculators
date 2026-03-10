@@ -38,6 +38,7 @@ envs.VLLM_WORKER_MULTIPROC_METHOD = "spawn"
 from speculators.data_generation.config_generator import (  # noqa: E402
     DataGenerationConfig,
 )
+from speculators.train import manifest as manifest_mod  # noqa: E402
 from speculators.data_generation.logging_utils import PipelineLogger  # noqa: E402
 from speculators.data_generation.preprocessing import (  # noqa: E402
     load_and_preprocess_dataset,
@@ -173,6 +174,26 @@ def parse_args():
         default=8,
         help="Number of CPU processes for dataset preprocessing (default: 8)",
     )
+
+    # Online/streaming training support
+    parser.add_argument(
+        "--manifest-path",
+        type=str,
+        default=None,
+        help="Path to manifest.json for online training coordination (default: None)",
+    )
+    parser.add_argument(
+        "--shard-id",
+        type=int,
+        default=0,
+        help="Shard ID for multi-node datagen (default: 0)",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Total number of datagen shards (default: 1)",
+    )
     return parser.parse_args()
 
 
@@ -306,6 +327,14 @@ def generate_and_save_hidden_states(args, dataset):
                 futures.append(future)
                 file_idx += 1
 
+            # Update manifest after each batch
+            if args.manifest_path:
+                manifest_files = [
+                    {"idx": int(k), "path": f"data_{k}.pt", "length": v, "train_count": 0}
+                    for k, v in sample_lengths.items()
+                ]
+                manifest_mod.write(args.manifest_path, manifest_files, "generating")
+
         log.info("Waiting for remaining file saves to complete...")
         for future in tqdm(
             as_completed(futures), total=len(futures), desc="Saving files"
@@ -350,7 +379,23 @@ def main():
         assistant_pattern=args.assistant_pattern,
         turn_dropout=args.turn_dropout,
     )
+    # Apply sharding if requested
+    if args.num_shards > 1:
+        total = len(dataset)
+        shard_size = total // args.num_shards
+        start = args.shard_id * shard_size
+        end = start + shard_size if args.shard_id < args.num_shards - 1 else total
+        dataset = dataset.select(range(start, end))
+        log.info(
+            f"Shard {args.shard_id}/{args.num_shards}: "
+            f"samples {start}-{end} ({len(dataset)} total)"
+        )
+
     num_saved = generate_and_save_hidden_states(args, dataset)
+
+    # Mark manifest as complete
+    if args.manifest_path:
+        manifest_mod.mark_complete(args.manifest_path)
 
     log.section("Data generation complete!")
     log.info(f"Saved {num_saved} files to {args.output_dir}")
