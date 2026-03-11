@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qwen3-32b-eagle3
+  labels:
+    app: speculators
+    task: eagle3-training
+    model: qwen3-32b
+spec:
+  restartPolicy: Never
+  # Pin to the target node
+  nodeName: "host-10-83-115-23"
+
+  containers:
+    - name: eagle3-trainer
+      image: speculators:v0.16.0
+      imagePullPolicy: IfNotPresent
+      command: ["bash", "/data/run_qwen3_32b_eagle3_train_only.sh"]
+
+      env:
+        - name: MODEL_PATH
+          value: "/data/models/Qwen3-32B"
+        - name: OUTPUT_PATH
+          value: "/data/output/qwen3_32b_eagle3"
+        - name: HF_HUB_OFFLINE
+          value: "1"
+        - name: NUM_GPUS
+          value: "8"
+        - name: HF_HOME
+          value: "/data/hf_cache"
+        - name: NCCL_DEBUG
+          value: "WARN"
+        - name: VLLM_ATTENTION_BACKEND
+          value: "FLASHINFER"
+        - name: VLLM_USE_V1
+          value: "0"
+        # Fix: host driver lib (580.126.09) must load before stale compat lib (575.57.08)
+        - name: LD_LIBRARY_PATH
+          value: "/lib/x86_64-linux-gnu:/usr/local/nvidia/lib64:/usr/local/cuda/lib64"
+
+      resources:
+        limits:
+          nvidia.com/gpu: "8"
+        requests:
+          nvidia.com/gpu: "8"
+          memory: "256Gi"
+          cpu: "64"
+
+      volumeMounts:
+        - name: data-volume
+          mountPath: /data
+        - name: speculators-code
+          mountPath: /workspace/speculators
+        - name: shm
+          mountPath: /dev/shm
+
+  volumes:
+    # Mount host /data (contains models, output, cache)
+    - name: data-volume
+      hostPath:
+        path: /data
+        type: Directory
+    # Mount speculators source code from host
+    - name: speculators-code
+      hostPath:
+        path: /root/develop/speculators
+        type: Directory
+    # Shared memory for PyTorch DataLoader workers & NCCL
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: "256Gi"

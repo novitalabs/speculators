@@ -261,17 +261,22 @@ class VllmHiddenStatesGenerator:
             request_id_to_idx[req_id] = i
             request_id_to_prompt_len[req_id] = len(ids_list)
 
-            req = Request(
+            request_kwargs = dict(
                 request_id=req_id,
                 prompt_token_ids=ids_list,
                 sampling_params=SamplingParams(
                     max_tokens=MAX_DECODE_TOKENS, temperature=SAMPLING_TEMPERATURE
                 ),
                 pooling_params=None,
-                eos_token_id=self.tokenizer.eos_token_id,
                 arrival_time=INITIAL_ARRIVAL_TIME,
                 block_hasher=self.block_hasher,
             )
+            # eos_token_id was removed from Request in vLLM v0.17.0
+            import inspect
+
+            if "eos_token_id" in inspect.signature(Request.__init__).parameters:
+                request_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
+            req = Request(**request_kwargs)
             self.scheduler.add_request(req)
 
         # Increment to ensure unique request IDs across calls

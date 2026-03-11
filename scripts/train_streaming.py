@@ -122,7 +122,7 @@ def create_transformer_layer_config(
     )
     if hasattr(verifier_config, "text_config"):
         verifier_config = verifier_config.text_config
-    return config_class(
+    transformer_layer_config = config_class(
         vocab_size=verifier_config.vocab_size,
         hidden_size=verifier_config.hidden_size,
         intermediate_size=verifier_config.intermediate_size,
@@ -135,26 +135,35 @@ def create_transformer_layer_config(
         rms_norm_eps=verifier_config.rms_norm_eps,
         head_dim=getattr(verifier_config, "head_dim", None),
     )
+    transformer_layer_config._attn_implementation = "simple_flex_attention"  # noqa: SLF001
+    return transformer_layer_config
 
 
 def resolve_file_paths(data_path: str, manifest_files: list[dict]) -> list[str]:
-    """Resolve manifest file entries to absolute paths."""
-    return [os.path.join(data_path, f["path"]) for f in manifest_files]
+    """Resolve manifest file entries to absolute paths, filtering to only existing files."""
+    paths = []
+    for f in manifest_files:
+        p = os.path.join(data_path, f["path"])
+        if os.path.exists(p):
+            paths.append(p)
+    return paths
 
 
 def wait_for_min_files(
     manifest_path: str,
+    data_path: str,
     min_files: int,
     poll_interval: float = 10.0,
 ) -> dict:
-    """Block until manifest has at least min_files entries."""
+    """Block until at least min_files .pt files actually exist on disk."""
     while True:
         m = manifest_mod.read(manifest_path)
-        if len(m["files"]) >= min_files:
+        existing = resolve_file_paths(data_path, m["files"])
+        if len(existing) >= min_files:
             return m
         root_logger.info(
-            f"Waiting for data: {len(m['files'])}/{min_files} files ready, "
-            f"polling every {poll_interval}s..."
+            f"Waiting for data: {len(existing)}/{min_files} files on disk "
+            f"({len(m['files'])} in manifest), polling every {poll_interval}s..."
         )
         time.sleep(poll_interval)
 
@@ -214,7 +223,8 @@ def main(args: argparse.Namespace):
 
     # Wait for enough data to start
     manifest = wait_for_min_files(
-        args.manifest_path, args.min_samples, poll_interval=args.poll_interval
+        args.manifest_path, args.data_path, args.min_samples,
+        poll_interval=args.poll_interval,
     )
     all_files = resolve_file_paths(args.data_path, manifest["files"])
 
@@ -281,16 +291,17 @@ def main(args: argparse.Namespace):
 
         trainer.train_epoch(epoch)
 
-        if is_distributed:
-            torch.distributed.barrier()
+        torch.cuda.empty_cache()
+        root_logger.info(f"Epoch {epoch}: training complete, starting validation...")
 
         if val_loader is not None:
             trainer.val_epoch(epoch)
 
-        if is_distributed:
-            torch.distributed.barrier()
+        root_logger.info(f"Epoch {epoch}: validation complete, saving checkpoint...")
 
         trainer.save_checkpoint(epoch)
+
+        root_logger.info(f"Epoch {epoch}: checkpoint saved.")
 
         # Update manifest train_count for trained files
         trained_paths = {os.path.basename(f) for f in train_files}

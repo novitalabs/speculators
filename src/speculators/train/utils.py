@@ -1,5 +1,6 @@
 import logging
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -30,7 +31,12 @@ def maybe_setup_distributed() -> tuple[int, int, int, bool]:
     if acc is None:
         raise ValueError("No accelerator found")
     backend = torch.distributed.get_default_backend_for_device(acc)
-    dist.init_process_group(backend, device_id=local_rank)
+    nccl_timeout = int(os.environ.get("NCCL_TIMEOUT", "1800"))
+    dist.init_process_group(
+        backend,
+        device_id=local_rank,
+        timeout=timedelta(seconds=nccl_timeout),
+    )
 
     rank = dist.get_rank()
 

@@ -212,6 +212,11 @@ class Eagle3SampleFileDataset(Dataset):
         #  "loss_mask": [seq_len],
         # }
 
+        # Replace NaN values in hidden states to prevent training corruption
+        for key in ("hidden_states", "verifier_last_hidden_states"):
+            if key in data and data[key].isnan().any():
+                data[key] = torch.nan_to_num(data[key], nan=0.0)
+
         # Convert hidden states to the correct dtype
         data = {
             k: v.to(self.hidden_states_dtype) if "hidden_states" in k else v
