@@ -13,7 +13,8 @@ fi
 BASE_MODEL="${MODEL_PATH:-/data/models/MiniMax-M2.5}"
 AURORA_SPEC="/data/models/Aurora-Spec-Minimax-M2.1"
 NOVITA_SPEC="/data/output/minimax_m2.5_eagle3_novita_vllm"
-OUTPUT_DIR="/data/output/minimax_m2.5_eval"
+NOVITA2_SPEC="/data/output/minimax_m2.5_eagle3_novita2_vllm"
+OUTPUT_DIR="/data/output/minimax_m2.5_eval6"
 TP="${TP:-4}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 
@@ -39,25 +40,40 @@ import os
 import sys
 import time
 import gc
+import random
 
 BASE_MODEL = os.environ["BASE_MODEL"]
 OUTPUT_DIR = os.environ["OUTPUT_DIR"]
 TP = int(os.environ["TP"])
 MAX_MODEL_LEN = int(os.environ["MAX_MODEL_LEN"])
+NOVITA_DATA = os.environ.get("NOVITA_DATA", "/data/datasets/novita20260309/conversations.jsonl")
 
-# Prompts: mix of general and coding tasks
-PROMPTS = [
-    "Write a Python function that implements binary search on a sorted list. Include docstring and type hints.",
-    "Explain the difference between TCP and UDP protocols. When would you use each one?",
-    "Write a bash script that monitors disk usage and sends an alert when any partition exceeds 90% capacity.",
-    "What are the key differences between REST and GraphQL APIs? Provide examples.",
-    "Implement a simple LRU cache in Python using OrderedDict. Include get and put methods.",
-    "Explain how garbage collection works in Java. What are the different GC algorithms?",
-    "Write a SQL query to find the top 5 customers by total order value, including their most recent order date.",
-    "Describe the CAP theorem and its implications for distributed database design.",
-    "Write a React component that implements an infinite scroll list with virtualization.",
-    "Explain how TLS 1.3 handshake works step by step.",
-]
+# Load Novita prompts: sample 10 conversations, use system+user messages as chat context
+def load_novita_prompts(path, n=10, seed=42):
+    """Load multi-turn conversations from Novita data as chat prompts."""
+    convs = []
+    with open(path) as f:
+        for line in f:
+            convs.append(json.loads(line))
+    random.seed(seed)
+    sampled = random.sample(convs, min(n, len(convs)))
+    prompts = []
+    for c in sampled:
+        msgs = c["conversations"]
+        # Take system + first user message (truncate user content to fit in context)
+        chat = []
+        for m in msgs:
+            if m["role"] == "system":
+                chat.append({"role": "system", "content": m["content"][:2000]})
+            elif m["role"] == "user":
+                chat.append({"role": "user", "content": m["content"][:2000]})
+                break  # only first user turn
+        if any(m["role"] == "user" for m in chat):
+            prompts.append(chat)
+    return prompts
+
+CHAT_PROMPTS = load_novita_prompts(NOVITA_DATA)
+print(f"[INFO] Loaded {len(CHAT_PROMPTS)} Novita chat prompts")
 
 
 def run_eval(name, spec_config=None, enforce_eager=False):
@@ -98,9 +114,9 @@ def run_eval(name, spec_config=None, enforce_eager=False):
         temperature=0.6, top_p=0.95, max_tokens=512, ignore_eos=True,
     )
 
-    print(f"[INFO] Running inference on {len(PROMPTS)} prompts (512 tokens each)...")
+    print(f"[INFO] Running chat inference on {len(CHAT_PROMPTS)} Novita prompts (512 tokens each)...")
     start = time.time()
-    outputs = llm.generate(PROMPTS, sampling_params)
+    outputs = llm.chat(CHAT_PROMPTS, sampling_params)
     elapsed = time.time() - start
 
     total_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
@@ -111,7 +127,7 @@ def run_eval(name, spec_config=None, enforce_eager=False):
         "total_tokens": total_tokens,
         "elapsed_seconds": round(elapsed, 2),
         "throughput_tokens_per_sec": round(throughput, 2),
-        "num_prompts": len(PROMPTS),
+        "num_prompts": len(CHAT_PROMPTS),
     }
 
     # Extract spec decode metrics
@@ -162,7 +178,7 @@ def run_eval(name, spec_config=None, enforce_eager=False):
 
 if __name__ == "__main__":
     # Get which evals to run from command line args
-    evals_to_run = sys.argv[1:] if len(sys.argv) > 1 else ["baseline", "aurora_spec", "novita_spec"]
+    evals_to_run = sys.argv[1:] if len(sys.argv) > 1 else ["baseline", "aurora_spec", "novita2_spec"]
 
     all_results = []
 
@@ -181,6 +197,12 @@ if __name__ == "__main__":
                 "num_speculative_tokens": 3,
                 "method": "eagle3",
             }, enforce_eager=True)
+        elif eval_name == "novita2_spec":
+            result = run_eval("novita2_spec", {
+                "model": os.environ.get("NOVITA2_SPEC", "/data/output/minimax_m2.5_eagle3_novita2_vllm"),
+                "num_speculative_tokens": 3,
+                "method": "eagle3",
+            })
         else:
             print(f"[WARN] Unknown eval: {eval_name}")
             continue
@@ -218,14 +240,16 @@ PYEOF
 # Run evaluations
 ###############################################################################
 export BASE_MODEL OUTPUT_DIR TP MAX_MODEL_LEN
-export AURORA_SPEC NOVITA_SPEC
+export AURORA_SPEC NOVITA_SPEC NOVITA2_SPEC
 
 # Run each eval in a separate process for clean GPU memory
 # Use per-eval inductor cache dirs to avoid torch.compile cache conflicts
 # (different draft models have different weight shapes)
-for eval_name in baseline aurora_spec novita_spec; do
+for eval_name in baseline novita2_spec aurora_spec; do
     echo ""
     echo ">>> Starting eval: $eval_name"
+    # Clear vLLM compile cache to avoid shape conflicts between different draft models
+    rm -rf /root/.cache/vllm/torch_compile_cache/ 2>/dev/null || true
     TORCHINDUCTOR_CACHE_DIR="/tmp/torchinductor_${eval_name}" \
     python3 "$OUTPUT_DIR/eval_runner.py" "$eval_name" || echo "[WARN] $eval_name eval failed"
     echo ">>> Finished eval: $eval_name"

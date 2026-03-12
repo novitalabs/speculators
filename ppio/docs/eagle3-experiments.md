@@ -351,11 +351,11 @@ Large-scale online training: 50000 samples with true streaming (datagen and trai
   - Training: 8 GPUs FSDP, lr=3e-5, FINAL_EPOCHS=10, MIN_SAMPLES=5000
   - NCCL_TIMEOUT=1800 (30 min, increased from default 600s)
 - **Output**: `/data/output/minimax_m2.5_eagle3_online_50k/`
-- **Status**: IN PROGRESS (epoch 1+ training)
+- **Status**: COMPLETED
 
 ### Issues Encountered
 
-1. **NCCL `_ALLGATHER_BASE` timeout at epoch boundary**: Training steps complete (303-612 steps/epoch) but crashes during validation/checkpoint phase. Root cause: default NCCL timeout (600s / 10 min) is too short for FSDP validation with ~5000 val files on a large MoE model. The `dist.reduce` calls in `val_epoch` accumulate latency.
+1. **NCCL `_ALLGATHER_BASE` timeout at epoch boundary**: Training steps complete (303-677 steps/epoch) but crashes during validation/checkpoint phase. Root cause: default NCCL timeout (600s / 10 min) is too short for FSDP validation with ~5000 val files on a large MoE model. The `dist.reduce` calls in `val_epoch` accumulate latency.
    - **Failed 4 times** before fix:
      - Run 1: 1460 files, hung at work 402 after 20 steps
      - Run 2: 542 files, hung at work 142 after 28 steps
@@ -367,15 +367,47 @@ Large-scale online training: 50000 samples with true streaming (datagen and trai
 
 2. **Code not synced to training node**: Pod on .18 mounts hostPath `/root/develop/speculators` from .18's filesystem. Code edits on the dev machine don't auto-propagate. **Fix**: `rsync` code to .18 before pod restart.
 
-### Training Results (partial)
+### Training Results
 
 | Epoch | Val Loss | Top-1 Acc | Cond Acc 1 | Cond Acc 2 |
 |-------|----------|-----------|------------|------------|
 | 0     | 9.636    | 54.9%     | 41.3%      | 34.8%      |
+| 1     | 7.851    | 63.2%     | 50.2%      | 43.9%      |
+| 2     | 6.817    | 68.2%     | 56.2%      | 51.4%      |
+| 3     | 6.181    | 70.8%     | 59.7%      | 56.2%      |
+| 4     | 5.803    | 72.2%     | 61.6%      | 58.8%      |
+| 5     | 5.556    | 73.1%     | 62.8%      | 60.5%      |
+| 6     | 5.377    | 73.7%     | 63.6%      | 61.7%      |
+| 7     | 5.235    | 74.2%     | 64.2%      | 62.5%      |
+| 8     | 5.131    | 74.6%     | 64.7%      | 62.9%      |
+| **9** | **5.043**| **74.9%** | **65.3%**  | **63.8%**  |
 
-- Epoch 0 already outperforms the 5K experiment (52.9% final acc) with only 1 epoch
-- Training time per epoch: ~50 min (45000 files, 8x H200)
-- Datagen: 50000 samples completed on .21
+- **Best checkpoint**: epoch 9 (val_loss=5.043, top1_acc=74.9%)
+- **Training time**: ~7.5 hours (10 epochs, 8x H200), ~45 min/epoch
+- **Datagen time**: ~6 hours (50000 samples, TP=4, .21)
+- **Checkpoints**: `/data/output/minimax_m2.5_eagle3_online_50k/checkpoints/` on .18
+
+### Comparison with Previous Experiments
+
+| Metric | Offline 10K (Exp 4) | Online 5K (Exp 6) | Novita 812 (Exp 7) | **Online 50K (Exp 8)** |
+|--------|--------------------|--------------------|--------------------|-----------------------|
+| Data | sharegpt+UC (9957) | sharegpt (5000) | novita (812) | **sharegpt (50000)** |
+| Val Loss | 9.118 | 10.166 | **1.952** | 5.043 |
+| Top-1 Acc | 56.0% | 52.9% | 81.5%* | **74.9%** |
+| Cond Acc 1 | 40.3% | 39.0% | 83.8%* | **65.3%** |
+| Cond Acc 2 | 32.9% | 32.7% | 86.2%* | **63.8%** |
+| Training | ~70 min | ~55 min | ~50 min | ~7.5 hours |
+
+*Novita results are domain-specific (coding agent conversations) and not directly comparable.
+
+### Analysis
+
+- 50K ShareGPT achieves **74.9% top-1 accuracy**, a massive improvement over offline 10K (56.0%) and online 5K (52.9%)
+- More data consistently helps: 5K→50K provides +22pp accuracy boost (52.9%→74.9%)
+- Conditional accuracy is excellent: 65.3% / 63.8% for 2nd/3rd draft tokens
+- Loss is still improving at epoch 9 — more epochs could yield further gains
+- The model has not yet converged (epoch 8→9 still improves), suggesting 15-20 epochs may be optimal for 50K data
+- The NCCL timeout issue was the main blocker; once resolved, all 10 epoch boundaries crossed without issues
 
 ---
 
@@ -469,6 +501,143 @@ Weight verification confirmed all weights match exactly after conversion (max_di
    - Aurora uses `num_attention_heads=24` making Q = hidden_size (standard)
    - Eagle3 draft model's QKV input is always `2 × hidden_size` (embeds + hidden concatenated)
    - `fc` layer: `3 × hidden_size → hidden_size` (3 aux hidden states from layers 2, 31, 59)
+
+- **Status**: COMPLETED
+
+---
+
+## Experiment 10: MiniMax-M2.5 Eagle3 Training (Novita 5K)
+
+Training with 5000 samples from Novita production API logs (weilan55/novita20260309).
+
+- **Datagen node**: .23 (8x H200 143GB)
+- **Training node**: .14 (8x H200 143GB)
+- **Image**: speculators:v0.17.0
+- **Data**: `weilan55/novita20260309` → 10K conversations preprocessed from 800K API log records
+  - Source: Novita production MiniMax-M2.5 API gateway logs (coding agent)
+  - Preprocessed: `k8s/preprocess_novita_logs.py` → 10,000 conversations (avg 62.2 turns)
+  - Datagen: 5000 samples, TP=4 on .23
+- **Config**:
+  - Training: 8 GPUs FSDP, lr=3e-5, 10 epochs, seq_len=8192
+  - Constant LR scheduler
+- **Output**: `/data/output/minimax_m2.5_eagle3_novita2/`
+- **Status**: COMPLETED
+
+### Training Results
+
+| Epoch | Val Loss | Top-1 Acc | Cond Acc 1 | Cond Acc 2 |
+|-------|----------|-----------|------------|------------|
+| 0     | 2.254    | 57.3%     | 38.3%      | 30.3%      |
+| 1     | 1.581    | 63.1%     | 44.9%      | 36.6%      |
+| 2     | 1.230    | 66.7%     | 48.5%      | 40.0%      |
+| 3     | 1.053    | 68.8%     | 50.8%      | 42.3%      |
+| 4     | 0.942    | 70.1%     | 52.5%      | 44.0%      |
+| 5     | 0.872    | 71.0%     | 53.7%      | 45.2%      |
+| 6     | 0.822    | 71.7%     | 54.5%      | 46.1%      |
+| 7     | 0.790    | 72.1%     | 55.3%      | 46.8%      |
+| **8** | **0.776**| **72.5%** | **57.0%**  | **46.7%**  |
+| 9     | 0.782    | 72.4%     | 55.7%      | 47.0%      |
+
+- **Best checkpoint**: epoch 8 (val_loss=0.776, top1_acc=72.5%)
+- **vLLM conversion**: `k8s/convert_speculators_to_vllm_eagle3.py` → `/data/output/minimax_m2.5_eagle3_novita2_vllm/`
+
+### Analysis
+
+- 5K Novita samples (val_loss=0.776) dramatically lower loss than 812 Novita (1.952) and 5K ShareGPT (10.166)
+- Top-1 accuracy 72.5% vs 81.5% (812 Novita) reflects less overfitting with 6× more data
+- Still converging at epoch 8 — more data or epochs could improve further
+
+---
+
+## Experiment 11: MiniMax-M2.5 Eagle3 Inference Evaluation v2 (Novita2 vs Aurora)
+
+Evaluating the Novita2 (5K) draft model against Aurora-Spec and baseline.
+
+- **Node**: .14 (TP=4, 4x H200)
+- **Eval script**: `k8s/run_minimax_m2.5_eval.sh`
+- **Config**: 10 prompts, 512 tokens each, temperature=0.6, ignore_eos=True, seed=42
+
+### Eval 2: General prompts (coding + tech questions)
+
+| Model | Tokens/s | Speedup | Acc Length | Acc@0 | Acc@1 | Acc@2 |
+|-------|----------|---------|-----------|-------|-------|-------|
+| **Baseline** | 441.7 | 1.00x | - | - | - | - |
+| **Aurora-Spec** | 390.7 | 0.88x | 1.792 | 49.7% | 20.8% | 8.8% |
+| **Novita2** (eager) | 113.4 | 0.26x | 1.268 | 25.6% | 1.2% | 0.1% |
+
+### Eval 3: Novita in-domain prompts (from training data conversations)
+
+| Model | Tokens/s | Speedup | Acc Length | Acc@0 | Acc@1 | Acc@2 |
+|-------|----------|---------|-----------|-------|-------|-------|
+| **Baseline** | 426.7 | 1.00x | - | - | - | - |
+| **Aurora-Spec** | 376.7 | 0.88x | 1.596 | 40.1% | 14.6% | 4.8% |
+| **Novita2** (eager) | 128.3 | 0.30x | 1.781 | **48.2%** | **20.9%** | **9.0%** |
+
+### Eval 4: Held-out Novita prompts (weilan55/novita20260312_eval — not in training set, enforce_eager)
+
+Data: 1354 conversations preprocessed from 44489 log records (March 12 export, not in training set).
+Note: Novita2 still using `enforce_eager=True` (torch.compile cache conflict not yet fixed).
+
+| Model | Tokens/s | Speedup | Acc Length | Acc@0 | Acc@1 | Acc@2 |
+|-------|----------|---------|-----------|-------|-------|-------|
+| **Baseline** | 399.8 | 1.00x | - | - | - | - |
+| **Aurora-Spec** | 303.3 | 0.76x | 1.743 | **46.5%** | **19.0%** | **8.8%** |
+| **Novita2** (eager) | 126.2 | 0.32x | 1.682 | 42.1% | 17.8% | 8.3% |
+
+### Eval 5: torch.compile fix — Novita2 only (held-out 0312 data)
+
+Fixed torch.compile by clearing vLLM compile cache (`~/.cache/vllm/torch_compile_cache/`) between eval runs.
+
+| Model | Tokens/s (eager) | Tokens/s (compiled) | Speedup |
+|-------|-----------------|--------------------:|---------|
+| **Novita2** | 126.2 | **323.9** | **2.5x** |
+
+### Eval 6: Full 3-way comparison with torch.compile fix (held-out 0312 data)
+
+All models now using torch.compile (no enforce_eager). Cache cleared between each run.
+
+| Model | Tokens/s | Speedup | Acc Length | Acc@0 | Acc@1 | Acc@2 |
+|-------|----------|---------|-----------|-------|-------|-------|
+| **Baseline** | 383.6 | 1.00x | - | - | - | - |
+| **Aurora-Spec** | 386.6 | **1.01x** | 1.840 | **52.0%** | **22.7%** | **9.2%** |
+| **Novita2** (compiled) | 320.4 | 0.84x | 1.668 | 40.9% | 17.3% | 8.6% |
+
+### Cross-eval Summary
+
+| Eval | Prompts | Aurora Acc@0 | Novita2 Acc@0 | Winner |
+|------|---------|-------------|---------------|--------|
+| Eval 2 | General (coding/tech) | 49.7% | 25.6% | Aurora |
+| Eval 3 | Novita in-domain (0309) | 40.1% | **48.2%** | **Novita2** |
+| Eval 4-6 | Novita held-out (0312) | **52.0%** | 40.9% | Aurora |
+
+### torch.compile Cache Conflict — Root Cause and Fix
+
+**Problem**: Running different draft models sequentially in the same pod caused `AssertionError: expected size 2048==1280` during `profile_run`.
+
+**Root cause**: vLLM's compile cache at `~/.cache/vllm/torch_compile_cache/<hash>/rank_X_Y/eagle_head` uses a hash based on the target model config, not the draft model config. When Aurora (num_attention_heads=24, QKV dim=1280/TP) and Novita2 (num_attention_heads=48, QKV dim=2048/TP) run sequentially, the second eval reuses the first's cached compiled graph with incompatible tensor shapes.
+
+**Fix**: Clear `~/.cache/vllm/torch_compile_cache/` before each eval run:
+```bash
+rm -rf /root/.cache/vllm/torch_compile_cache/ 2>/dev/null || true
+```
+
+**Impact**: Novita2 throughput improved from 126 tok/s (enforce_eager) to 320-324 tok/s (compiled) — **2.5× speedup**.
+
+### Analysis
+
+1. **Aurora still wins overall**: 52% acceptance and 1.01x throughput (slight speedup over baseline). Novita2 at 41% acceptance is 0.84x baseline — overhead still exceeds the speculation benefit.
+
+2. **torch.compile fix eliminates the throughput penalty**: Novita2 went from 0.32x to 0.84x baseline. The remaining gap is purely due to lower acceptance rates, not compilation issues.
+
+3. **Acceptance rate is the bottleneck**: At 41% Acc@0 with 3 draft tokens, the average acceptance length of 1.67 is not enough to overcome the draft model's overhead. Need ~50%+ Acc@0 to break even.
+
+4. **Aurora generalizes better**: Despite being trained for MiniMax-M2.1 (not M2.5), Aurora's training on diverse data gives it better generalization than our domain-specific 5K Novita model.
+
+### Key Takeaways
+
+- **torch.compile cache conflict was the #1 throughput blocker** — now fixed
+- Domain-specific Novita training data helps on in-distribution eval but doesn't generalize
+- To beat Aurora, need: (a) more diverse training data (50K+ mixed domain), (b) higher acceptance rates (train longer or with more data), or (c) match Aurora's architecture (num_attention_heads=24) for potential compile optimization benefits
 
 - **Status**: COMPLETED
 
