@@ -114,7 +114,7 @@ while true; do
 
     for node in "${NODES[@]}"; do
         echo "[$(date)] Syncing from $node:$REMOTE_DIR ..."
-        rsync -az --include='*.pt' --include='sample_lengths.json' --exclude='*' \
+        rsync -az --include='*.pt' --include='manifest.json' --include='sample_lengths.json' --exclude='*' \
             "$node:$REMOTE_DIR/" "$LOCAL_DIR/" || echo "rsync from $node failed, retrying next cycle"
 
         if ! check_remote_complete "$node" 2>/dev/null; then

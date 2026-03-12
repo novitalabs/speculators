@@ -232,7 +232,9 @@ def main(args: argparse.Namespace):
     random.seed(args.seed)
     shuffled = list(all_files)
     random.shuffle(shuffled)
-    num_train = int(len(shuffled) * 0.9)
+    num_val = int(len(shuffled) * args.val_ratio)
+    num_val = min(num_val, args.max_val_files)
+    num_train = len(shuffled) - num_val
     val_files = shuffled[num_train:]
     val_file_set = set(val_files)
     train_files = [f for f in all_files if f not in val_file_set]
@@ -399,6 +401,14 @@ def parse_args():
     parser.add_argument(
         "--poll-interval", type=float, default=10.0,
         help="Seconds between manifest polls when waiting for data",
+    )
+    parser.add_argument(
+        "--val-ratio", type=float, default=0.1,
+        help="Fraction of initial files to use for validation (default: 0.1)",
+    )
+    parser.add_argument(
+        "--max-val-files", type=int, default=200,
+        help="Maximum number of validation files (default: 200)",
     )
 
     return parser.parse_args()

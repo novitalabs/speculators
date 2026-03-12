@@ -1,0 +1,105 @@
+#!/bin/bash
+set -euo pipefail
+
+###############################################################################
+# MiniMax-M2.5 Novita Full Streaming Training
+# Runs: (1) rsync from datagen node, (2) buffer cleanup, (3) streaming training
+###############################################################################
+
+export HF_HUB_OFFLINE=1
+export HF_HOME=/data/hf_cache
+export LOCAL_TRAIN_ENV=1
+
+VERIFIER_NAME_OR_PATH="${MODEL_PATH:-/data/models/MiniMax-M2.5}"
+OUTPUT_PATH="${OUTPUT_PATH:-/data/output/minimax_m2.5_eagle3_novita_full}"
+NUM_GPUS="${NUM_GPUS:-8}"
+SEQ_LENGTH="${SEQ_LENGTH:-8192}"
+LR="${LR:-3e-5}"
+MIN_SAMPLES="${MIN_SAMPLES:-5000}"
+FINAL_EPOCHS="${FINAL_EPOCHS:-10}"
+POLL_INTERVAL="${POLL_INTERVAL:-30}"
+DATAGEN_NODE="${DATAGEN_NODE:-10.83.115.21}"
+BUFFER_MAX_SIZE_GB="${BUFFER_MAX_SIZE_GB:-1024}"
+
+GEN_DIR="$OUTPUT_PATH/gen"
+MANIFEST_PATH="$GEN_DIR/manifest.json"
+REMOTE_GEN_DIR="$OUTPUT_PATH/gen"
+
+echo "============================================="
+echo " MiniMax-M2.5 Novita Full Streaming Training"
+echo " Model:        $VERIFIER_NAME_OR_PATH"
+echo " Data:         $GEN_DIR"
+echo " Manifest:     $MANIFEST_PATH"
+echo " GPUs:         $NUM_GPUS"
+echo " Min Samples:  $MIN_SAMPLES"
+echo " Final Epochs: $FINAL_EPOCHS"
+echo " Datagen Node: $DATAGEN_NODE"
+echo " Buffer Max:   ${BUFFER_MAX_SIZE_GB}GB"
+echo "============================================="
+
+mkdir -p "$OUTPUT_PATH"/{checkpoints,logs} "$GEN_DIR"
+
+# Ensure 'python' is available
+if ! command -v python &>/dev/null; then
+    ln -s "$(command -v python3)" /usr/local/bin/python
+fi
+
+cd /workspace/speculators
+
+###############################################################################
+# Background: rsync from datagen node
+###############################################################################
+echo "[sync] Starting rsync loop from $DATAGEN_NODE..."
+bash scripts/sync_datagen.sh \
+    --datagen-nodes "$DATAGEN_NODE" \
+    --remote-dir "$REMOTE_GEN_DIR" \
+    --local-dir "$GEN_DIR" \
+    --manifest-path "$MANIFEST_PATH" \
+    --poll-interval "$POLL_INTERVAL" \
+    > "$OUTPUT_PATH/logs/sync.log" 2>&1 &
+SYNC_PID=$!
+echo "[sync] PID=$SYNC_PID"
+
+###############################################################################
+# Background: buffer cleanup (enforce 1TB cap)
+###############################################################################
+echo "[cleanup] Starting buffer cleanup (max ${BUFFER_MAX_SIZE_GB}GB)..."
+python scripts/buffer_cleanup.py \
+    --manifest-path "$MANIFEST_PATH" \
+    --data-dir "$GEN_DIR" \
+    --min-train-count 2 \
+    --max-size-gb "$BUFFER_MAX_SIZE_GB" \
+    --poll-interval 60 \
+    > "$OUTPUT_PATH/logs/cleanup.log" 2>&1 &
+CLEANUP_PID=$!
+echo "[cleanup] PID=$CLEANUP_PID"
+
+###############################################################################
+# Foreground: streaming training
+###############################################################################
+torchrun \
+    --standalone \
+    --nproc_per_node="$NUM_GPUS" \
+    scripts/train_streaming.py \
+    --verifier-name-or-path "$VERIFIER_NAME_OR_PATH" \
+    --manifest-path "$MANIFEST_PATH" \
+    --data-path "$GEN_DIR" \
+    --save-path "$OUTPUT_PATH/checkpoints" \
+    --log-dir "$OUTPUT_PATH/logs" \
+    --lr "$LR" \
+    --total-seq-len "$SEQ_LENGTH" \
+    --min-samples "$MIN_SAMPLES" \
+    --final-epochs "$FINAL_EPOCHS" \
+    --poll-interval "$POLL_INTERVAL" \
+    --num-workers 4 \
+    --prefetch-factor 2 \
+    --max-val-files 200 \
+    --run-name "minimax_m2.5_eagle3_novita_full"
+
+# Kill background processes
+kill $SYNC_PID $CLEANUP_PID 2>/dev/null || true
+
+echo "============================================="
+echo " Streaming training complete!"
+echo " Checkpoints: $OUTPUT_PATH/checkpoints"
+echo "============================================="
