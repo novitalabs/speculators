@@ -74,7 +74,7 @@ spec:
         type: Directory
     - name: speculators-code
       hostPath:
-        path: /root/develop/speculators
+        path: /data/tengwan/develop/speculators
         type: Directory
     - name: shm
       emptyDir:

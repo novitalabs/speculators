@@ -200,9 +200,16 @@ class Eagle3SampleFileDataset(Dataset):
         ]
 
     def __getitem__(self, index) -> BatchType:
-        data = torch.load(
-            self.data[index], mmap=True, weights_only=True, map_location="cpu"
-        )
+        try:
+            data = torch.load(
+                self.data[index], mmap=True, weights_only=True, map_location="cpu"
+            )
+        except (FileNotFoundError, OSError):
+            # File may have been deleted by buffer cleanup — fall back to another sample
+            alt_index = (index + 1) % len(self.data)
+            data = torch.load(
+                self.data[alt_index], mmap=True, weights_only=True, map_location="cpu"
+            )
 
         data = self.standardize_fn(data)
         # data structure: {

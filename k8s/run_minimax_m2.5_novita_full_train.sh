@@ -44,6 +44,12 @@ if ! command -v python &>/dev/null; then
     ln -s "$(command -v python3)" /usr/local/bin/python
 fi
 
+# Install rsync and ssh client (not in vllm base image)
+if ! command -v rsync &>/dev/null; then
+    echo "[setup] Installing rsync and openssh-client..."
+    apt-get update -qq && apt-get install -y -qq rsync openssh-client 2>/dev/null
+fi
+
 cd /workspace/speculators
 
 ###############################################################################
