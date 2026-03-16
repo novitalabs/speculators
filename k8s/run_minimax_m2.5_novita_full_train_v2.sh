@@ -44,10 +44,17 @@ if ! command -v python &>/dev/null; then
     ln -s "$(command -v python3)" /usr/local/bin/python
 fi
 
+# Ensure hostname resolves (needed for torchrun with hostNetwork)
+if ! getent hosts "$(hostname)" &>/dev/null; then
+    echo "127.0.0.1 $(hostname)" >> /etc/hosts
+fi
+
 # Install rsync and ssh client (not in vllm base image)
 if ! command -v rsync &>/dev/null; then
     echo "[setup] Installing rsync and openssh-client..."
+    export http_proxy=http://127.0.0.1:1083 https_proxy=http://127.0.0.1:1083
     apt-get update -qq && apt-get install -y -qq rsync openssh-client 2>/dev/null
+    unset http_proxy https_proxy
 fi
 
 cd /workspace/speculators

@@ -8,13 +8,15 @@ metadata:
     model: minimax-m2.5
 spec:
   restartPolicy: Never
-  nodeName: "host-10-83-115-22"
+  nodeName: "host-10-83-115-18"
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
 
   containers:
     - name: streaming-train
       image: speculators:v0.17.0
       imagePullPolicy: IfNotPresent
-      command: ["bash", "/data/run_minimax_m2.5_novita_full_train_v2.sh"]
+      command: ["bash", "/workspace/speculators/k8s/run_minimax_m2.5_novita_full_train_v2.sh"]
 
       env:
         - name: MODEL_PATH
@@ -34,7 +36,7 @@ spec:
         - name: POLL_INTERVAL
           value: "30"
         - name: DATAGEN_NODE
-          value: "10.83.115.21"
+          value: "10.83.115.17"
         - name: BUFFER_MAX_SIZE_GB
           value: "1024"
         - name: HF_HUB_OFFLINE

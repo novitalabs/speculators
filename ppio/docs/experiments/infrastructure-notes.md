@@ -17,3 +17,9 @@
 - **rsync in vllm containers**: vllm-openai images don't include rsync/ssh-client. Must `apt-get install rsync openssh-client` after pod start
 - **Bash glob limit**: `ls *.pt` fails with 30K+ files. Use `find -name '*.pt' | wc -l` instead
 - **Code sync to pod nodes**: K8s pods with hostPath mounts use the node's local filesystem. Always `rsync` code changes to the target node before restarting pods
+- **apt-get in pods without network**: Pods without `hostNetwork: true` can't reach apt mirrors. Use `hostNetwork: true` + proxy: `export http_proxy=http://127.0.0.1:1083 https_proxy=http://127.0.0.1:1083` before `apt-get`
+- **torchrun hostname resolution with hostNetwork**: K8s hostnames (e.g., `host-10-83-115-18`) may not resolve inside containers with `hostNetwork: true`. Fix: add `echo "127.0.0.1 $(hostname)" >> /etc/hosts` before torchrun
+- **Image building on containerd-only clusters**: No docker; use `nerdctl run --net=host` + pip install + `nerdctl commit` to build images. Export with `ctr images export`, import with `ctr -n k8s.io images import`
+- **Containerd proxy for image pulls**: Create `/etc/systemd/system/containerd.service.d/http-proxy.conf` with `HTTP_PROXY`/`HTTPS_PROXY` env vars, then `systemctl daemon-reload && systemctl restart containerd`
+- **Production pods on GPU nodes**: Always check `kubectl get pods --all-namespaces -o wide | grep <node>` before deploying. dynamo-system pods use all 8 GPUs and must not be killed
+- **Novita dataset has multiple export files**: The HuggingFace dataset `weilan55/novita20260309` has a different tar.gz than the local copy on .14. Always verify the correct file (799K records vs 11K) via `wc -l`

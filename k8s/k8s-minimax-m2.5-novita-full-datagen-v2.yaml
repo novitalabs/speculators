@@ -8,13 +8,13 @@ metadata:
     model: minimax-m2.5
 spec:
   restartPolicy: Never
-  nodeName: "host-10-83-115-21"
+  nodeName: "host-10-83-115-17"
 
   containers:
     - name: datagen
       image: speculators:v0.17.0
       imagePullPolicy: IfNotPresent
-      command: ["bash", "/data/run_minimax_m2.5_novita_full_datagen_v2.sh"]
+      command: ["bash", "/workspace/speculators/k8s/run_minimax_m2.5_novita_full_datagen_v2.sh"]
 
       env:
         - name: MODEL_PATH

@@ -25,7 +25,7 @@ targeting vLLM inference acceleration.
 | [10](experiments/exp10-minimax-novita-5k.md) | MiniMax-M2.5 Training (Novita 5K) | MiniMax-M2.5 | Novita 5K | 72.5% | COMPLETED |
 | [11](experiments/exp11-minimax-eval-v2.md) | Inference Eval v2 (Novita2 vs Aurora) | MiniMax-M2.5 | - | Aurora 1.01x | COMPLETED |
 | [12](experiments/exp12-minimax-novita-full-38k.md) | Full Novita 38K (Online Streaming) | MiniMax-M2.5 | Novita 38K | - | STOPPED |
-| [13](experiments/exp13-minimax-novita-full-56k.md) | Full Novita ~56K (No Turn Filter) | MiniMax-M2.5 | Novita ~56K | - | PENDING |
+| [13](experiments/exp13-minimax-novita-full-56k.md) | Full Novita ~52K (No Turn Filter) | MiniMax-M2.5 | Novita ~52K | - | IN PROGRESS |
 
 *Domain-specific accuracy (coding agent conversations), not directly comparable.
 
