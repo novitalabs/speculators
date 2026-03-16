@@ -3,7 +3,7 @@ Check GPU node availability and production service status across the PPIO cluste
 Run the following check script and present the results in a clear table:
 
 ```bash
-bash scripts/check_nodes.sh
+bash ppio/scripts/check_nodes.sh
 ```
 
 ## What to check
