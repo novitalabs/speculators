@@ -1,0 +1,86 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: minimax-m2-5-novita-full-train-v2
+  labels:
+    app: speculators
+    task: novita-full-train-v2
+    model: minimax-m2.5
+spec:
+  restartPolicy: Never
+  nodeName: "host-10-83-115-22"
+
+  containers:
+    - name: streaming-train
+      image: speculators:v0.17.0
+      imagePullPolicy: IfNotPresent
+      command: ["bash", "/data/run_minimax_m2.5_novita_full_train_v2.sh"]
+
+      env:
+        - name: MODEL_PATH
+          value: "/data/models/MiniMax-M2.5"
+        - name: OUTPUT_PATH
+          value: "/data/output/minimax_m2.5_eagle3_novita_full_v2"
+        - name: NUM_GPUS
+          value: "8"
+        - name: SEQ_LENGTH
+          value: "8192"
+        - name: LR
+          value: "3e-5"
+        - name: MIN_SAMPLES
+          value: "5000"
+        - name: FINAL_EPOCHS
+          value: "10"
+        - name: POLL_INTERVAL
+          value: "30"
+        - name: DATAGEN_NODE
+          value: "10.83.115.21"
+        - name: BUFFER_MAX_SIZE_GB
+          value: "1024"
+        - name: HF_HUB_OFFLINE
+          value: "1"
+        - name: HF_HOME
+          value: "/data/hf_cache"
+        - name: NCCL_DEBUG
+          value: "INFO"
+        - name: NCCL_TIMEOUT
+          value: "3600"
+        - name: LD_LIBRARY_PATH
+          value: "/lib/x86_64-linux-gnu:/usr/local/nvidia/lib64:/usr/local/cuda/lib64"
+
+      resources:
+        limits:
+          nvidia.com/gpu: "8"
+        requests:
+          nvidia.com/gpu: "8"
+          memory: "256Gi"
+          cpu: "64"
+
+      volumeMounts:
+        - name: data-volume
+          mountPath: /data
+        - name: speculators-code
+          mountPath: /workspace/speculators
+        - name: shm
+          mountPath: /dev/shm
+        - name: ssh-keys
+          mountPath: /root/.ssh
+          readOnly: true
+
+  volumes:
+    - name: data-volume
+      hostPath:
+        path: /data
+        type: Directory
+    - name: speculators-code
+      hostPath:
+        path: /data/tengwan/develop/speculators
+        type: Directory
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: "256Gi"
+    - name: ssh-keys
+      hostPath:
+        path: /root/.ssh
+        type: Directory
