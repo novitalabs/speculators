@@ -276,6 +276,31 @@ def cleanup(manifest, min_train_count=2):
 | 2 TB | ~7600 | 单节点推荐 |
 | 5 TB | ~19000 | 大规模训练 |
 
+### Cleanup ↔ Training 协调
+
+**关键教训 (Exp 13 crash)**: cleanup 后台进程和 training 之间存在 race condition。
+cleanup 可能在 DataLoader 正在使用文件时将其删除，导致训练崩溃。
+
+**协调机制**:
+
+```
+Training:   [==== Epoch N ====] unlock [==== Epoch N+1 ====] unlock
+                 locked                      locked
+Cleanup:    skip  skip  skip   DELETE   skip  skip  skip   DELETE
+```
+
+1. **Epoch lock**: training 在 epoch 开始时写 `<data_dir>/.epoch_in_progress`，
+   epoch 结束且 `increment_train_count` 完成后删除。Cleanup 看到锁文件就跳过本轮。
+
+2. **删除速率限制** (`--max-delete-per-cycle`): 每个 cleanup 周期最多删 N 个文件（默认 5000）。
+   即使意外绕过锁，也不会一次性清空所有数据。
+
+3. **最小保留量** (`--min-retain-count`): manifest 中始终保留至少 N 个文件（默认 1000）。
+   即使所有文件都 train_count 达标，也不会删到 0。
+
+4. **DataLoader 端容错** (`data.py`): `__getitem__` 遇到 `FileNotFoundError` 时尝试最多 5 个替代文件。
+   这是最后一道防线，不应依赖它。
+
 ### 对训练质量的影响
 
 - Ring buffer 意味着每个样本只被训练有限次（不像 offline 可以 10 epoch 反复训练同一批数据）

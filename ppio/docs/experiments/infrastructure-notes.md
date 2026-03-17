@@ -23,3 +23,41 @@
 - **Containerd proxy for image pulls**: Create `/etc/systemd/system/containerd.service.d/http-proxy.conf` with `HTTP_PROXY`/`HTTPS_PROXY` env vars, then `systemctl daemon-reload && systemctl restart containerd`
 - **Production pods on GPU nodes**: Always check `kubectl get pods --all-namespaces -o wide | grep <node>` before deploying. dynamo-system pods use all 8 GPUs and must not be killed
 - **Novita dataset has multiple export files**: The HuggingFace dataset `weilan55/novita20260309` has a different tar.gz than the local copy on .14. Always verify the correct file (799K records vs 11K) via `wc -l`
+
+## Buffer Cleanup ↔ Training 协调 (Exp 13 Crash Postmortem)
+
+**根因**: buffer_cleanup.py 每 60s 轮询一次，可以在 training DataLoader 正在加载文件时删除它们。Exp 13 Epoch 1 crash：cleanup 一次性删除全部 11045 个 train_count>=2 的文件，DataLoader 的所有 fallback 也失败。
+
+**时间线**:
+1. Epoch 0 结束 → `increment_train_count` 把 11045 文件标记为 train_count=2
+2. Training 重读 manifest → 解析到 11045 文件（cleanup 还没跑）
+3. Training 打印 "Epoch 1: 11045 train files"，开始构建 DataLoader
+4. **buffer_cleanup 轮询** → 看到 11045 文件 train_count>=2 → **全部删除**
+5. DataLoader workers 尝试加载 → FileNotFoundError → fallback 也失败 → crash
+
+**修复** (3 层防护):
+1. **Epoch lock file**: training 写 `.epoch_in_progress` 锁文件，cleanup 看到锁就跳过本轮
+2. **`--max-delete-per-cycle`** (默认 5000): 每轮最多删 N 个文件，防止一次性清空
+3. **`--min-retain-count`** (默认 1000): 始终保留至少 N 个文件在 manifest 中
+
+**教训**:
+- 后台清理进程 **永远不能** 假设数据没有被其他进程使用
+- 删除操作必须有 rate limit 和 minimum retain 两个安全阀
+- `data.py` 的 fallback 从 1 次增加到 5 次，但 fallback 不是主要防线
+
+## 大规模数据同步原则
+
+**问题**: 52K 文件 × 193MB = ~10TB 全量 rsync 耗时极长且无必要。Datagen 节点保存全部中间结果，但训练只需要最新的一个滚动窗口。
+
+**原则**:
+- **同步量要有上限**: 不要全量 rsync datagen 输出，只同步训练需要的量（如 ~1TB / ~5000 文件）
+- **优先同步最新文件**: 旧文件已被训练过或多轮迭代后不再需要
+- **Datagen 节点也需要清理**: datagen 生成无限输出，本地磁盘也需要 ring buffer
+- **实操**: 停掉全量 rsync → 用 `--files-from` 只同步最新 N 个文件 → 后续用 `sync_datagen.sh` 增量同步 + `buffer_cleanup.py` 维持磁盘上限
+
+**参考大小**:
+| 场景 | 建议 buffer 上限 | 文件数 |
+|------|-----------------|--------|
+| 快速验证 | 200 GB | ~1000 |
+| 标准训练 | 1 TB | ~5000 |
+| 大规模训练 | 2 TB | ~10000 |

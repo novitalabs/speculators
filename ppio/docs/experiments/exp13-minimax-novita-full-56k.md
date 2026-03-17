@@ -25,8 +25,29 @@ Exp 12 used `--min-turns 4` which reduced dataset from ~56K to 38K. This experim
   - `--min-turns 4` → `--min-turns 2` (no turn filter, ~56K vs 38K conversations)
   - Datagen node: .17, Training node: .18 (originally planned .21/.22 but those have production dynamo pods)
   - New output path: `minimax_m2.5_eagle3_novita_full_v2`
-- **Status**: IN PROGRESS
+- **Status**: RESTARTING (Epoch 1 crash, fix applied)
 - **Progress**:
-  - Datagen: Running on .17, ~1.2 batches/s (~52K samples, 13K batches, ~2.5h total)
-  - Training: Running on .18, waiting for 5000 files from rsync
+  - Datagen: COMPLETE on .17 (52,313 files generated)
+  - Training (attempt 1): Crashed at Epoch 1 — buffer_cleanup deleted all 11045 training files mid-epoch
+  - Training (attempt 2): Preparing restart with coordination fix
   - Note: Used `hostNetwork: true` on training pod for apt-get proxy + hostname resolution fix
+
+## Crash Report: Epoch 1 Buffer Cleanup Race Condition
+
+**Symptom**: Training crashed at start of Epoch 1 with cascading `FileNotFoundError`
+
+**Root cause**: `buffer_cleanup.py` runs every 60s in background. After Epoch 0, `increment_train_count`
+bumped all 11045 files to train_count=2. Before the DataLoader could load any file in Epoch 1,
+cleanup deleted ALL of them in a single pass. The single-retry fallback in `data.py` also failed
+because every alternative file was also deleted.
+
+**Fix applied** (branch `minimax`):
+1. `train_streaming.py`: writes `.epoch_in_progress` lock file during training, removed after `increment_train_count`
+2. `buffer_cleanup.py`: skips cleanup when lock exists + `--max-delete-per-cycle 5000` + `--min-retain-count 1000`
+3. `data.py`: fallback retries increased from 1 to 5
+4. `k8s/run_minimax_m2.5_novita_full_train_v2.sh`: re-enabled cleanup with safety flags
+
+**Restart plan**:
+- Stopped full rsync (was syncing all 52K files = 10TB, unnecessary)
+- Cleaned .18 disk, syncing only latest 5000 files (~940GB) via `rsync --files-from`
+- After sync: generate fresh manifest on .18, restart training pod with fixed code
