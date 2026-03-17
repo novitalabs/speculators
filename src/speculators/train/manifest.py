@@ -23,13 +23,19 @@ def write(
     manifest_path: str,
     files: list[dict[str, Any]],
     status: str = "generating",
+    **extra: Any,
 ) -> None:
-    """Write manifest.json atomically (write to tmp, then os.rename)."""
+    """Write manifest.json atomically (write to tmp, then os.rename).
+
+    Extra keyword arguments are written as top-level fields in the manifest
+    (e.g. total_remote_files, files_ever_seen_count, global_epoch).
+    """
     manifest = {
         "status": status,
         "files": files,
         "updated_at": datetime.now(tz=timezone.utc).isoformat(),
     }
+    manifest.update(extra)
     dir_name = os.path.dirname(os.path.abspath(manifest_path))
     os.makedirs(dir_name, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
@@ -76,4 +82,40 @@ def increment_train_count(manifest_path: str, trained_paths: set[str]) -> None:
     for f in manifest["files"]:
         if f["path"] in trained_paths:
             f["train_count"] = f.get("train_count", 0) + 1
-    write(manifest_path, manifest["files"], manifest["status"])
+    # Preserve extra top-level fields
+    extra = {k: v for k, v in manifest.items() if k not in ("status", "files", "updated_at")}
+    write(manifest_path, manifest["files"], manifest["status"], **extra)
+
+
+# ---------------------------------------------------------------------------
+# Eviction ledger — tracks cumulative train_count for evicted files
+# ---------------------------------------------------------------------------
+
+def read_ledger(data_dir: str) -> dict[str, int]:
+    """Read .eviction_ledger — {filename: cumulative_train_count}."""
+    path = os.path.join(data_dir, ".eviction_ledger")
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+def write_ledger(data_dir: str, ledger: dict[str, int]) -> None:
+    """Write .eviction_ledger atomically (tmpfile + rename)."""
+    path = os.path.join(data_dir, ".eviction_ledger")
+    fd, tmp_path = tempfile.mkstemp(dir=data_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(ledger, f, indent=2)
+        os.rename(tmp_path, path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def update_ledger(data_dir: str, evicted: dict[str, int]) -> None:
+    """Merge evicted files into ledger. evicted = {filename: cumulative_train_count}."""
+    ledger = read_ledger(data_dir)
+    ledger.update(evicted)
+    write_ledger(data_dir, ledger)

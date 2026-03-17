@@ -40,6 +40,7 @@ class TrainerConfig(NamedTuple):
     scheduler_warmup_steps: int | None = None
     scheduler_total_steps: int | None = None
     scheduler_num_cosine_cycles: float = 0.5
+    val_every_steps: int = 0  # 0 = no mid-epoch validation
 
 
 class Trainer:
@@ -193,6 +194,13 @@ class Trainer:
                 extra={"step": self.global_step},
             )
             self.global_step += 1
+
+            if (self.config.val_every_steps > 0
+                    and self.global_step % self.config.val_every_steps == 0
+                    and self.val_loader is not None):
+                root_logger.info(f"Step {self.global_step}: mid-epoch validation")
+                self.val_epoch(epoch)
+                self.model.train()  # restore train mode
 
     @torch.no_grad()
     def val_epoch(self, epoch: int):

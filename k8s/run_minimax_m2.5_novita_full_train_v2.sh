@@ -20,6 +20,9 @@ FINAL_EPOCHS="${FINAL_EPOCHS:-10}"
 POLL_INTERVAL="${POLL_INTERVAL:-30}"
 DATAGEN_NODE="${DATAGEN_NODE:-10.83.115.21}"
 BUFFER_MAX_SIZE_GB="${BUFFER_MAX_SIZE_GB:-1024}"
+TARGET_TRAIN_COUNT="${TARGET_TRAIN_COUNT:-10}"
+TARGET_GLOBAL_EPOCHS="${TARGET_GLOBAL_EPOCHS:-10}"
+VAL_EVERY_STEPS="${VAL_EVERY_STEPS:-500}"
 
 GEN_DIR="$OUTPUT_PATH/gen"
 MANIFEST_PATH="$GEN_DIR/manifest.json"
@@ -35,6 +38,9 @@ echo " Min Samples:  $MIN_SAMPLES"
 echo " Final Epochs: $FINAL_EPOCHS"
 echo " Datagen Node: $DATAGEN_NODE"
 echo " Buffer Max:   ${BUFFER_MAX_SIZE_GB}GB"
+echo " Target TC:    $TARGET_TRAIN_COUNT"
+echo " Target Epochs:$TARGET_GLOBAL_EPOCHS"
+echo " Val Steps:    $VAL_EVERY_STEPS"
 echo "============================================="
 
 mkdir -p "$OUTPUT_PATH"/{checkpoints,logs} "$GEN_DIR"
@@ -69,19 +75,22 @@ bash scripts/sync_datagen.sh \
     --local-dir "$GEN_DIR" \
     --manifest-path "$MANIFEST_PATH" \
     --poll-interval "$POLL_INTERVAL" \
+    --max-sync-size-gb "$BUFFER_MAX_SIZE_GB" \
+    --target-train-count "$TARGET_TRAIN_COUNT" \
     > "$OUTPUT_PATH/logs/sync.log" 2>&1 &
 SYNC_PID=$!
 echo "[sync] PID=$SYNC_PID"
 
 ###############################################################################
-# Background: buffer cleanup (enforce 1TB cap)
+# Background: buffer cleanup (with epoch lock + safety limits)
 ###############################################################################
-echo "[cleanup] Starting buffer cleanup (max ${BUFFER_MAX_SIZE_GB}GB)..."
+echo "[cleanup] Starting buffer cleanup (max_delete=5000, min_retain=1000)..."
 python scripts/buffer_cleanup.py \
     --manifest-path "$MANIFEST_PATH" \
     --data-dir "$GEN_DIR" \
-    --min-train-count 2 \
     --max-size-gb "$BUFFER_MAX_SIZE_GB" \
+    --max-delete-per-cycle 5000 \
+    --min-retain-count 1000 \
     --poll-interval 60 \
     > "$OUTPUT_PATH/logs/cleanup.log" 2>&1 &
 CLEANUP_PID=$!
@@ -107,10 +116,12 @@ torchrun \
     --num-workers 4 \
     --prefetch-factor 2 \
     --max-val-files 200 \
+    --val-every-steps "$VAL_EVERY_STEPS" \
+    --target-global-epochs "$TARGET_GLOBAL_EPOCHS" \
     --run-name "minimax_m2.5_eagle3_novita_full_v2"
 
 # Kill background processes
-kill $SYNC_PID $CLEANUP_PID 2>/dev/null || true
+kill $SYNC_PID ${CLEANUP_PID:+$CLEANUP_PID} 2>/dev/null || true
 
 echo "============================================="
 echo " Streaming training complete!"

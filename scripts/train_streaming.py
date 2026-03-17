@@ -16,6 +16,7 @@ Usage:
 import argparse
 import logging
 import os
+from pathlib import Path
 import random
 import time
 import warnings
@@ -278,6 +279,7 @@ def main(args: argparse.Namespace):
         train_call_kwargs=train_call_kwargs,
         val_call_kwargs=val_call_kwargs,
         scheduler_type="none",  # streaming: use constant lr
+        val_every_steps=args.val_every_steps,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
@@ -285,11 +287,20 @@ def main(args: argparse.Namespace):
     final_countdown = args.final_epochs
     datagen_complete = manifest["status"] == "complete"
 
+    epoch_lock_path = os.path.join(args.data_path, ".epoch_in_progress")
+
+    # Track unique files ever seen for global epoch computation
+    files_ever_seen: set[str] = set()
+    global_epoch_count = 0
+
     while True:
         root_logger.info(
             f"Epoch {epoch}: {len(train_files)} train files, "
             f"datagen_complete={datagen_complete}"
         )
+
+        # Signal to buffer_cleanup that an epoch is in progress
+        Path(epoch_lock_path).write_text(str(epoch))
 
         trainer.train_epoch(epoch)
 
@@ -306,13 +317,48 @@ def main(args: argparse.Namespace):
         root_logger.info(f"Epoch {epoch}: checkpoint saved.")
 
         # Update manifest train_count for trained files
-        trained_paths = {os.path.basename(f) for f in train_files}
-        manifest_mod.increment_train_count(args.manifest_path, trained_paths)
+        trained_basenames = {os.path.basename(f) for f in train_files}
+        files_ever_seen.update(trained_basenames)
+        manifest_mod.increment_train_count(args.manifest_path, trained_basenames)
+
+        # Read back manifest to get total_remote_files
+        manifest = manifest_mod.read(args.manifest_path)
+        total_remote = manifest.get("total_remote_files", 0)
+        global_epoch_count = (
+            len(files_ever_seen) // total_remote if total_remote > 0 else 0
+        )
+
+        root_logger.info(
+            f"Global progress: {len(files_ever_seen)}/{total_remote} unique files, "
+            f"global_epoch={global_epoch_count}"
+        )
+
+        # Write progress to manifest
+        extra = {k: v for k, v in manifest.items()
+                 if k not in ("status", "files", "updated_at")}
+        extra.update(
+            total_remote_files=total_remote,
+            files_ever_seen_count=len(files_ever_seen),
+            global_epoch=global_epoch_count,
+        )
+        manifest_mod.write(
+            args.manifest_path, manifest["files"], manifest["status"], **extra
+        )
+
+        # Release epoch lock — cleanup can now safely delete trained files
+        Path(epoch_lock_path).unlink(missing_ok=True)
 
         epoch += 1
 
         # Check termination
-        if datagen_complete:
+        if datagen_complete and total_remote > 0 and args.target_global_epochs > 0:
+            if global_epoch_count >= args.target_global_epochs:
+                root_logger.info(
+                    f"Reached {args.target_global_epochs} global epochs. Done!"
+                )
+                break
+        elif datagen_complete:
+            # Fallback to final_epochs countdown
             final_countdown -= 1
             root_logger.info(
                 f"Datagen complete. Final epochs remaining: {final_countdown}"
@@ -409,6 +455,14 @@ def parse_args():
     parser.add_argument(
         "--max-val-files", type=int, default=200,
         help="Maximum number of validation files (default: 200)",
+    )
+    parser.add_argument(
+        "--val-every-steps", type=int, default=0,
+        help="Run validation every N training steps (0 = only at epoch end)",
+    )
+    parser.add_argument(
+        "--target-global-epochs", type=int, default=10,
+        help="Terminate when this many global epochs are reached (0 = use --final-epochs fallback)",
     )
 
     return parser.parse_args()
