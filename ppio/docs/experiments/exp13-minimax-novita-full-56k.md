@@ -25,29 +25,53 @@ Exp 12 used `--min-turns 4` which reduced dataset from ~56K to 38K. This experim
   - `--min-turns 4` → `--min-turns 2` (no turn filter, ~56K vs 38K conversations)
   - Datagen node: .17, Training node: .18 (originally planned .21/.22 but those have production dynamo pods)
   - New output path: `minimax_m2.5_eagle3_novita_full_v2`
-- **Status**: RESTARTING (Epoch 1 crash, fix applied)
+- **Status**: RUNNING on .23 (resumed from checkpoint 9)
 - **Progress**:
-  - Datagen: COMPLETE on .17 (52,313 files generated)
-  - Training (attempt 1): Crashed at Epoch 1 — buffer_cleanup deleted all 11045 training files mid-epoch
-  - Training (attempt 2): Preparing restart with coordination fix
+  - Datagen (attempt 1): .17 — generated 52,313 files, but disk cleaned up, only 5K remained. .17 now occupied by PROD.
+  - Datagen (attempt 2): .21 — new datagen started, completed ~13K batches
+  - Training: Epoch 0-9 on .18, migrated to .23 after .18 GPU taken by mofeite
+  - V4 buffer system verified working: eviction ledger, train_count tracking, cleanup coordination
   - Note: Used `hostNetwork: true` on training pod for apt-get proxy + hostname resolution fix
 
-## Crash Report: Epoch 1 Buffer Cleanup Race Condition
+## Issue Log
 
+### Issue 1: Epoch 1 Buffer Cleanup Race — All Files Deleted (V3)
+
+**When**: First training attempt on .18
 **Symptom**: Training crashed at start of Epoch 1 with cascading `FileNotFoundError`
-
 **Root cause**: `buffer_cleanup.py` runs every 60s in background. After Epoch 0, `increment_train_count`
-bumped all 11045 files to train_count=2. Before the DataLoader could load any file in Epoch 1,
-cleanup deleted ALL of them in a single pass. The single-retry fallback in `data.py` also failed
-because every alternative file was also deleted.
-
-**Fix applied** (branch `minimax`):
-1. `train_streaming.py`: writes `.epoch_in_progress` lock file during training, removed after `increment_train_count`
+bumped all 11045 files to train_count=2. Cleanup deleted ALL of them in a single pass (no safety limits).
+**Fix**:
+1. `train_streaming.py`: writes `.epoch_in_progress` lock file during training
 2. `buffer_cleanup.py`: skips cleanup when lock exists + `--max-delete-per-cycle 5000` + `--min-retain-count 1000`
 3. `data.py`: fallback retries increased from 1 to 5
-4. `k8s/run_minimax_m2.5_novita_full_train_v2.sh`: re-enabled cleanup with safety flags
 
-**Restart plan**:
-- Stopped full rsync (was syncing all 52K files = 10TB, unnecessary)
-- Cleaned .18 disk, syncing only latest 5000 files (~940GB) via `rsync --files-from`
-- After sync: generate fresh manifest on .18, restart training pod with fixed code
+### Issue 2: V4 Manifest Overwrite — train_count Always 0
+
+**When**: After V4 deployment, epochs 6-9 on .18
+**Symptom**: Manifest showed `train_count=0` for all files despite 9 completed epochs. V4 extra fields (`total_remote_files`, `global_epoch`, `files_ever_seen_count`) missing.
+**Root cause**: `sync_datagen.sh` rsync command included `--include='manifest.json'`, which copied the REMOTE manifest (from datagen node, where all train_count=0) to local dir every 30s, overwriting training's `increment_train_count` writes.
+**Fix**: Removed `--include='manifest.json'` from rsync in `sync_datagen.sh`. The local `update_manifest()` function handles manifest generation from local file scan.
+
+### Issue 3: sync_datagen.sh Crash — `du` + `pipefail`
+
+**When**: After fixing Issue 2, restarting sync process
+**Symptom**: Sync process silently crashed immediately after restart
+**Root cause**: `du -sk` on the gen directory encountered a temporary rsync file (`.data_17653.pt.HXYi6A`) that disappeared during scan. With `set -euo pipefail`, the non-zero exit code from `du` propagated through the awk pipeline and killed the script.
+**Fix**: Wrapped du in subshell with `|| true`: `current_size_kb=$( (du -sk "$LOCAL_DIR" 2>/dev/null || true) | awk '{print $1}')`
+
+### Issue 4: Epoch 10 Crash — Cleanup Evicted Files During Training
+
+**When**: Epoch 9→10 transition on .18
+**Symptom**: `FileNotFoundError: data_1932.pt` during epoch 10 training
+**Root cause**: Cleanup checked epoch lock during the brief window when it was released between epochs (line 349), then spent ~45s evicting 5000 files while epoch 10 was already running. The epoch lock was re-set at the top of the loop (line 303), but cleanup didn't re-check it during its eviction loop.
+**Fix** (3 changes):
+1. `buffer_cleanup.py`: Re-check epoch lock inside eviction loop — stops early if new epoch starts
+2. `train_streaming.py`: Added 90s sleep after releasing epoch lock to let cleanup finish before rebuilding DataLoader
+3. `data.py`: Increased max_retries from 5 to 50, with random index fallback after first 5 sequential retries
+
+### Issue 5: .18 GPU Taken — Node Migration
+
+**When**: After epoch 10 crash, attempting to restart
+**Symptom**: `UnexpectedAdmissionError: Requested: 8, Available: 0` — all 8 GPUs occupied by `mofeite-vllm-kimi-25-h200`
+**Fix**: Migrated training to .23 — synced model, code, checkpoints, manifest from .18

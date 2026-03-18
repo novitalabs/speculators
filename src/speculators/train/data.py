@@ -200,10 +200,13 @@ class Eagle3SampleFileDataset(Dataset):
         ]
 
     def __getitem__(self, index) -> BatchType:
-        max_retries = 5
+        max_retries = 50
         for attempt in range(max_retries + 1):
             try:
-                load_index = (index + attempt) % len(self.data)
+                if attempt < 5:
+                    load_index = (index + attempt) % len(self.data)
+                else:
+                    load_index = random.randint(0, len(self.data) - 1)
                 data = torch.load(
                     self.data[load_index], mmap=True, weights_only=True, map_location="cpu"
                 )

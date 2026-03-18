@@ -347,6 +347,7 @@ def main(args: argparse.Namespace):
 
         # Release epoch lock — cleanup can now safely delete trained files
         Path(epoch_lock_path).unlink(missing_ok=True)
+        root_logger.info("Epoch lock released, waiting for cleanup + sync cycle...")
 
         epoch += 1
 
@@ -366,10 +367,19 @@ def main(args: argparse.Namespace):
             if final_countdown <= 0:
                 break
 
-        # Re-read manifest to absorb new files
-        manifest = manifest_mod.read(args.manifest_path)
-        all_files = resolve_file_paths(args.data_path, manifest["files"])
-        train_files = [f for f in all_files if f not in val_file_set]
+        # Wait for cleanup to finish and sync to replenish files
+        # This ensures enough train files exist before rebuilding the DataLoader
+        while True:
+            time.sleep(args.poll_interval)
+            manifest = manifest_mod.read(args.manifest_path)
+            all_files = resolve_file_paths(args.data_path, manifest["files"])
+            train_files = [f for f in all_files if f not in val_file_set]
+            if len(train_files) >= args.min_samples:
+                break
+            root_logger.info(
+                f"Waiting for files: {len(train_files)}/{args.min_samples} "
+                f"train files on disk, polling every {args.poll_interval}s..."
+            )
 
         if manifest["status"] == "complete":
             datagen_complete = True

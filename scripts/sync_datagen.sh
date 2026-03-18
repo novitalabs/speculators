@@ -191,7 +191,8 @@ while true; do
     for node in "${NODES[@]}"; do
         # Size gate: skip sync if local dir exceeds limit
         if [[ "$MAX_SYNC_SIZE_GB" -gt 0 ]]; then
-            current_size_kb=$(du -sk "$LOCAL_DIR" | awk '{print $1}')
+            current_size_kb=$( (du -sk "$LOCAL_DIR" 2>/dev/null || true) | awk '{print $1}')
+            current_size_kb=${current_size_kb:-0}
             max_size_kb=$((MAX_SYNC_SIZE_GB * 1024 * 1024))
             if [[ "$current_size_kb" -ge "$max_size_kb" ]]; then
                 echo "[$(date)] Local dir at ${current_size_kb}KB >= ${max_size_kb}KB limit, skipping sync from $node"
@@ -206,7 +207,7 @@ while true; do
 
         echo "[$(date)] Syncing from $node:$REMOTE_DIR ..."
         rsync -az $EXCLUDE_FLAG \
-            --include='*.pt' --include='manifest.json' --include='sample_lengths.json' --exclude='*' \
+            --include='*.pt' --include='sample_lengths.json' --exclude='*' \
             "$node:$REMOTE_DIR/" "$LOCAL_DIR/" || echo "rsync from $node failed, retrying next cycle"
 
         if ! check_remote_complete "$node" 2>/dev/null; then

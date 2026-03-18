@@ -94,6 +94,10 @@ def cleanup_once(
         remaining = len(all_files) - len(evicted_paths)
         if min_retain > 0 and remaining <= min_retain:
             break
+        # Re-check epoch lock — a new epoch may have started during eviction
+        if os.path.exists(lock_file):
+            log.info("Epoch started during eviction, stopping early")
+            break
 
         fpath = os.path.join(data_dir, f["path"])
         if os.path.exists(fpath):
