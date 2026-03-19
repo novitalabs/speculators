@@ -99,6 +99,7 @@ echo "[cleanup] PID=$CLEANUP_PID"
 ###############################################################################
 # Foreground: streaming training
 ###############################################################################
+TRAIN_LOG="$OUTPUT_PATH/logs/train.log"
 torchrun \
     --standalone \
     --nproc_per_node="$NUM_GPUS" \
@@ -118,7 +119,8 @@ torchrun \
     --max-val-files 200 \
     --val-every-steps "$VAL_EVERY_STEPS" \
     --target-global-epochs "$TARGET_GLOBAL_EPOCHS" \
-    --run-name "minimax_m2.5_eagle3_novita_full_v2"
+    --run-name "minimax_m2.5_eagle3_novita_full_v2" \
+    2>&1 | tee "$TRAIN_LOG"
 
 # Kill background processes
 kill $SYNC_PID ${CLEANUP_PID:+$CLEANUP_PID} 2>/dev/null || true

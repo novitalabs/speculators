@@ -1,11 +1,10 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: minimax-m2-5-novita-full-train-v2
+  name: eval-checkpoints-exp13
   labels:
     app: speculators
-    task: novita-full-train-v2
-    model: minimax-m2.5
+    task: eval-checkpoints
 spec:
   restartPolicy: Never
   nodeName: "host-10-83-115-18"
@@ -13,40 +12,43 @@ spec:
   dnsPolicy: ClusterFirstWithHostNet
 
   containers:
-    - name: streaming-train
+    - name: eval
       image: speculators:v0.17.0
       imagePullPolicy: IfNotPresent
-      command: ["bash", "/workspace/speculators/k8s/run_minimax_m2.5_novita_full_train_v2.sh"]
+      command:
+        - bash
+        - -c
+        - |
+          set -euo pipefail
+          if ! command -v python &>/dev/null; then
+            ln -s "$(command -v python3)" /usr/local/bin/python
+          fi
+          if ! getent hosts "$(hostname)" &>/dev/null; then
+            echo "127.0.0.1 $(hostname)" >> /etc/hosts
+          fi
+          cd /workspace/speculators
+          LOGFILE=/data/output/minimax_m2.5_eagle3_novita_full_v2/logs/eval.log
+          torchrun --standalone --nproc_per_node=8 scripts/eval_checkpoints.py \
+            --verifier-name-or-path /data/models/MiniMax-M2.5 \
+            --manifest-path /data/output/minimax_m2.5_eagle3_novita_full_v2/gen/manifest.json \
+            --data-path /data/output/minimax_m2.5_eagle3_novita_full_v2/gen \
+            --checkpoint-dir /data/output/minimax_m2.5_eagle3_novita_full_v2/checkpoints \
+            --checkpoints 40 60 80 100 120 135 \
+            --total-seq-len 8192 \
+            --max-val-files 200 \
+            2>&1 | tee "$LOGFILE"
 
       env:
-        - name: MODEL_PATH
-          value: "/data/models/MiniMax-M2.5"
-        - name: OUTPUT_PATH
-          value: "/data/output/minimax_m2.5_eagle3_novita_full_v2"
-        - name: NUM_GPUS
-          value: "8"
-        - name: SEQ_LENGTH
-          value: "8192"
-        - name: LR
-          value: "3e-5"
-        - name: MIN_SAMPLES
-          value: "5000"
-        - name: FINAL_EPOCHS
-          value: "10"
-        - name: POLL_INTERVAL
-          value: "30"
-        - name: DATAGEN_NODE
-          value: "10.83.115.17"
-        - name: BUFFER_MAX_SIZE_GB
-          value: "1024"
         - name: HF_HUB_OFFLINE
           value: "1"
         - name: HF_HOME
           value: "/data/hf_cache"
         - name: NCCL_DEBUG
-          value: "INFO"
+          value: "WARN"
         - name: NCCL_TIMEOUT
           value: "3600"
+        - name: VLLM_ATTENTION_BACKEND
+          value: "FLASH_ATTN"
         - name: LD_LIBRARY_PATH
           value: "/lib/x86_64-linux-gnu:/usr/local/nvidia/lib64:/usr/local/cuda/lib64"
 
@@ -65,9 +67,6 @@ spec:
           mountPath: /workspace/speculators
         - name: shm
           mountPath: /dev/shm
-        - name: ssh-keys
-          mountPath: /root/.ssh
-          readOnly: true
 
   volumes:
     - name: data-volume
@@ -82,7 +81,3 @@ spec:
       emptyDir:
         medium: Memory
         sizeLimit: "256Gi"
-    - name: ssh-keys
-      hostPath:
-        path: /root/.ssh
-        type: Directory

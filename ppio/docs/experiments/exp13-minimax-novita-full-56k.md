@@ -25,13 +25,30 @@ Exp 12 used `--min-turns 4` which reduced dataset from ~56K to 38K. This experim
   - `--min-turns 4` → `--min-turns 2` (no turn filter, ~56K vs 38K conversations)
   - Datagen node: .17, Training node: .18 (originally planned .21/.22 but those have production dynamo pods)
   - New output path: `minimax_m2.5_eagle3_novita_full_v2`
-- **Status**: RUNNING on .23 (resumed from checkpoint 9)
+- **Status**: COMPLETE — best model at checkpoint 60, val loss 0.729
+- **Final Model**: Checkpoint 60 at `/data/output/minimax_m2.5_eagle3_novita_full_v2/checkpoints/60/`
+- **Final Metrics** (checkpoint 60, fixed val set):
+
+  | Metric | Layer 0 | Layer 1 | Layer 2 | Total |
+  |--------|---------|---------|---------|-------|
+  | loss | 0.112 | 0.247 | 0.369 | **0.729** |
+  | cond_acc | 0.782 | 0.742 | 0.744 | — |
+  | full_acc | 0.782 | 0.692 | 0.618 | — |
+
 - **Progress**:
   - Datagen (attempt 1): .17 — generated 52,313 files, but disk cleaned up, only 5K remained. .17 now occupied by PROD.
   - Datagen (attempt 2): .21 — new datagen started, completed ~13K batches
   - Training: Epoch 0-9 on .18, migrated to .23 after .18 GPU taken by mofeite
+  - Training: Epoch 10-12 on .23, with two NCCL incidents (Issues 6, 8) and one insufficient-files crash (Issue 7)
+  - Checkpoints 0-12 saved. Checkpoint 13 lost due to validation hang.
   - V4 buffer system verified working: eviction ledger, train_count tracking, cleanup coordination
   - Note: Used `hostNetwork: true` on training pod for apt-get proxy + hostname resolution fix
+  - Note: .23 may have NCCL hardware instability — consider migrating to another node if issues persist
+  - **2026-03-18**: Resumed on .17 + .18. Synced checkpoints 10-12 from .23→.18, synced 26K gen files from .23→.17 and .23→.18. Cleaned stale manifest on .17 (had `status:complete` with 52313 entries but only 5K .pt files, causing datagen to skip). Datagen restarted fresh on .17, training resumed from checkpoint 12 into epoch 13 on .18 with 18864 local files.
+  - **2026-03-19**: Training ran to epoch 135. Observed apparent overfitting in training-time val loss (rose from 1.79 at epoch 20 to 2.99 at epoch 134), but this was caused by **unstable val set** — buffer cleanup/sync changed the files available each epoch, so val set composition shifted over time. Re-evaluated checkpoints 19-135 with a **fixed val set** (100 files, deterministic split using `scripts/eval_checkpoints.py`). True val loss curve: 1.007 (ckpt 19) → 0.729 (ckpt 60, best) → 0.823 (ckpt 135). Overfitting starts around epoch 60-80, primarily in layers 1 and 2.
+- **Lessons learned**:
+  - Online streaming training with buffer eviction causes val set instability — val metrics logged during training are unreliable. Always re-evaluate with a fixed val set.
+  - Created `scripts/eval_checkpoints.py` for offline checkpoint evaluation with FSDP support.
 
 ## Issue Log
 
@@ -75,3 +92,24 @@ bumped all 11045 files to train_count=2. Cleanup deleted ALL of them in a single
 **When**: After epoch 10 crash, attempting to restart
 **Symptom**: `UnexpectedAdmissionError: Requested: 8, Available: 0` — all 8 GPUs occupied by `mofeite-vllm-kimi-25-h200`
 **Fix**: Migrated training to .23 — synced model, code, checkpoints, manifest from .18
+
+### Issue 6: NCCL Timeout on .23 — Epoch 10
+
+**When**: First training attempt on .23, epoch 10 (resumed from checkpoint 9)
+**Symptom**: Training hung for 3600s during forward pass, NCCL watchdog triggered: `SeqNum=3511`, all GPUs at 100% but no progress
+**Root cause**: Transient GPU communication failure on .23 (possibly hardware-related)
+**Fix**: Restarted pod — training resumed from checkpoint 9
+
+### Issue 7: Epoch 12→13 Crash — Insufficient Files After Cleanup
+
+**When**: Transition from epoch 12 to epoch 13 on .23
+**Symptom**: `IndexError` in `MultipackDistributedBatchSamplerV2` — only 404 train files remained after cleanup eviction
+**Root cause**: After epoch lock release, cleanup evicted files aggressively, but the fixed 90s sleep wasn't enough for sync's `update_manifest()` to run and replenish file list. DataLoader was rebuilt with only 404 files (below `min_samples=5000`).
+**Fix**: Replaced fixed 90s sleep with a `wait_for_min_files` polling loop in `train_streaming.py` that waits until `min_samples` train files exist on disk before rebuilding the DataLoader.
+
+### Issue 8: Validation Hang After Epoch 13
+
+**When**: After epoch 13 training completed on .23
+**Symptom**: Validation stuck for 30+ minutes — GPU at 100% utilization but no log output. Likely NCCL deadlock during `dist.reduce` in validation.
+**Root cause**: Second NCCL instability incident on .23 (similar to Issue 6), this time during validation's distributed reduction
+**Fix**: Restarted pod. Checkpoint 13 was not saved (hang occurred before save). Resumed from checkpoint 12.
