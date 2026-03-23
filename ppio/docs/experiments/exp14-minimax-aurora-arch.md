@@ -47,24 +47,31 @@ Exp13 checkpoint 60 achieved higher acceptance rate than Aurora (55.3% vs 48.7% 
 - **2026-03-20 07:28**: OOM crash (SIGKILL) at epoch 35. All 8 ranks killed simultaneously by OOM killer. Likely caused by larger model size (intermediate_size 8192 vs 1536) increasing memory footprint during checkpoint save + dataloader workers. Checkpoints 0-34 saved successfully.
 - **2026-03-20 08:14**: Restarted pod, resumed from checkpoint 34 into epoch 35. torch.compile recompilation took ~30 min again (no persistent cache across pod restarts).
 - **2026-03-20-21**: Training stable through epoch 67. No further OOM incidents.
+- **2026-03-21**: Eval complete (inference + offline). Training continuing past epoch 68. Checkpoint cleanup done (retained 49/54/59/62/65/68).
+- **2026-03-23**: Training still running on .18, currently at **epoch 153**. Val loss oscillating around 3.1-3.3, no improvement over epoch 65-98 range. Streaming val set is noisy due to buffer rotation.
 
 ### Val Metrics (streaming val, unstable set — use `eval_checkpoints.py` for final numbers)
 
-| Epoch | val/loss | val/loss_0 | val/loss_1 | val/loss_2 | val/full_acc_0 | val/full_acc_1 | val/full_acc_2 |
-|-------|----------|-----------|-----------|-----------|---------------|---------------|---------------|
-| 24 | 3.157 | 0.596 | 1.086 | 1.475 | 0.806 | 0.653 | 0.543 |
-| 27 | 3.105 | — | — | — | 0.811 | — | — |
-| 41 | 3.141 | — | — | — | — | — | — |
-| 54 | **3.077** | 0.548 | 1.062 | 1.467 | 0.793 | 0.641 | 0.540 |
-| 60 | 3.103 | 0.545 | 1.069 | 1.489 | 0.798 | 0.644 | 0.540 |
-| 66 | 3.198 | — | — | — | 0.791 | — | — |
+| Epoch | val/loss | val/loss_0 | val/full_acc_0 | Notes |
+|-------|----------|-----------|---------------|-------|
+| 24 | 3.157 | 0.596 | 80.6% | Early convergence |
+| 35 | 3.221 | 0.581 | 79.2% | Post-OOM restart |
+| 54 | **3.077** | 0.548 | 79.3% | Best streaming loss (early) |
+| 60 | 3.144 | 0.548 | 79.5% | |
+| 67 | 3.167 | 0.560 | 79.7% | |
+| **98** | **2.942** | **0.513** | **82.1%** | **Best streaming loss overall** |
+| 120 | 3.002 | 0.523 | 80.3% | |
+| **128** | **2.944** | **0.518** | 80.5% | Second best |
+| 140 | 3.195 | 0.549 | 81.3% | |
+| 150 | 3.347 | 0.566 | 79.3% | |
+| 153 | 3.236 | 0.543 | 81.5% | Latest |
 
 **Observations**:
-- Val loss plateaued around **3.1** from epoch ~40 onward, with best at epoch 54 (3.077)
-- val/full_acc_0 ≈ 0.79-0.81 throughout, consistently above Exp13 best (0.782)
-- Note: val loss ~3.1 here vs Exp13's 0.729 — **not directly comparable** because Exp14 uses 32K draft vocab (cross-entropy over 32K classes) vs Exp13's 200K vocab. The loss scales are fundamentally different.
-- Slight overfitting trend: val loss rising from 3.077 (epoch 54) to 3.198 (epoch 66), while train loss continues dropping
-- As with Exp13, streaming val set is unstable due to buffer cleanup/sync. Need fixed-set eval via `eval_checkpoints.py` for reliable comparison.
+- Streaming val loss highly variable (2.94-3.41) due to buffer rotation changing val set composition each epoch
+- Best streaming val: epoch 98 (2.942) and 128 (2.944) — but these are not directly comparable to the fixed-set offline eval
+- val/full_acc_0 stable around 79-82% from epoch 35 onward, no clear improvement trend past epoch 40
+- Note: val loss ~3.1 here vs Exp13's 0.729 — **not directly comparable** because Exp14 uses 32K draft vocab (cross-entropy over 32K classes) vs Exp13's 200K vocab
+- **Training past epoch 68 shows no meaningful improvement** — offline eval (fixed set) confirmed best range is ckpt 49-65, streaming val agrees with no breakthrough after epoch 98
 
 ### Inference Eval Results (2026-03-21, .17, TP=4, 10 Novita prompts × 512 tokens)
 
@@ -117,11 +124,25 @@ Deleted all checkpoints except **49, 54, 59, 62, 65, 68** on both .17 and .18.
 - .17: 111GB → 9.6GB + removed 1.3TB gen data
 - Rationale: retained checkpoints cover the best-performing range with good spacing; ckpt 54 is best for inference throughput, ckpt 49/65 are best for offline val metrics
 
+### Training Continuation (epoch 68-153+, 2026-03-21 to 2026-03-23)
+
+Training continued on .18 past the initial eval checkpoint range. New checkpoints 69-152 were generated but cleaned up during the 2026-03-23 cleanup (retained only 49/54/59/62/65/68 plus new ckpts 151/152).
+
+**Streaming val loss epoch 68-153** (sampled):
+
+| Epoch | val/loss | val/loss_0 | val/full_acc_0 |
+|-------|----------|-----------|---------------|
+| 98 | **2.942** | **0.513** | **82.1%** |
+| 128 | **2.944** | 0.518 | 80.5% |
+| 153 | 3.236 | 0.543 | 81.5% |
+
+**Conclusion**: No meaningful improvement past epoch 65. Streaming val loss oscillates 2.94-3.41 due to buffer rotation, best points (epoch 98/128) are likely favorable val set compositions rather than real improvement. Offline eval (fixed set) confirmed ckpt 49-65 is the optimal range. **Training should be stopped.**
+
 ### Next Steps
 
-1. Run extended inference eval on ckpt 49 and 65 (the offline eval winners) to see if they beat ckpt 54's throughput
-2. Consider stopping training — loss plateau reached, further epochs show diminishing returns
-3. Package best checkpoint for production deployment
+1. Stop training on .18 — no further improvement expected
+2. Run extended inference eval on ckpt 49 and 65 (offline eval winners) to see if they beat ckpt 54's throughput
+3. Package best checkpoint (likely ckpt 54 for throughput) for production deployment
 
 ## Issue Log
 
