@@ -46,9 +46,25 @@ Exp 12 used `--min-turns 4` which reduced dataset from ~56K to 38K. This experim
   - Note: .23 may have NCCL hardware instability — consider migrating to another node if issues persist
   - **2026-03-18**: Resumed on .17 + .18. Synced checkpoints 10-12 from .23→.18, synced 26K gen files from .23→.17 and .23→.18. Cleaned stale manifest on .17 (had `status:complete` with 52313 entries but only 5K .pt files, causing datagen to skip). Datagen restarted fresh on .17, training resumed from checkpoint 12 into epoch 13 on .18 with 18864 local files.
   - **2026-03-19**: Training ran to epoch 135. Observed apparent overfitting in training-time val loss (rose from 1.79 at epoch 20 to 2.99 at epoch 134), but this was caused by **unstable val set** — buffer cleanup/sync changed the files available each epoch, so val set composition shifted over time. Re-evaluated checkpoints 19-135 with a **fixed val set** (100 files, deterministic split using `scripts/eval_checkpoints.py`). True val loss curve: 1.007 (ckpt 19) → 0.729 (ckpt 60, best) → 0.823 (ckpt 135). Overfitting starts around epoch 60-80, primarily in layers 1 and 2.
+- **Inference Eval** (2026-03-19, novita20260312_eval held-out data, 10 prompts × 512 tokens, vLLM on .18):
+
+  | Model | Tokens/s | Acc Length | Acc@0 | Acc@1 | Acc@2 | Notes |
+  |-------|----------|-----------|-------|-------|-------|-------|
+  | Baseline (no spec) | 103.8 | — | — | — | — | torch.compile |
+  | **Exp13 ckpt60** | 11.4 | **1.887** | **55.3%** | **23.1%** | **10.3%** | enforce_eager |
+  | Aurora-Spec-M2.1 | 28.7 | 1.749 | 48.7% | 18.8% | 7.5% | torch.compile |
+
+  **Acceptance rate**: Ckpt60 beats Aurora by +6.6% Acc@0 (55.3% vs 48.7%) and +7.9% acceptance length (1.887 vs 1.749), showing domain-trained models significantly outperform general-purpose Aurora on Novita traffic.
+
+  **Throughput issue (TODO)**: Both speculative models are slower than baseline — this is wrong and needs investigation:
+  - Ckpt60 (11.4 tok/s): Uses `enforce_eager` due to 48-head architecture causing torch.compile cache conflict with target model. The 48 heads match MiniMax-M2.5's `num_attention_heads=48`, but Aurora uses 24 heads which avoids the conflict. **Fix**: Retrain with `num_attention_heads=24` to enable torch.compile, or investigate the torch.compile cache conflict root cause.
+  - Aurora (28.7 tok/s): Despite torch.compile, still slower than baseline (103.8). Likely due to speculative decoding overhead on MoE models — the draft+verify cycle adds latency that isn't offset by the ~49% acceptance rate. May need higher acceptance rates (>60%) or more speculative tokens to achieve speedup on MoE.
+  - Both results may also be affected by first-run compilation overhead amortized over only 10 short prompts. Need to test with more prompts and exclude warmup.
+
 - **Lessons learned**:
   - Online streaming training with buffer eviction causes val set instability — val metrics logged during training are unreliable. Always re-evaluate with a fixed val set.
   - Created `scripts/eval_checkpoints.py` for offline checkpoint evaluation with FSDP support.
+  - Domain-specific training (52K Novita conversations) yields significantly higher acceptance rates than general-purpose Aurora-Spec, but architectural choices (num_attention_heads) impact torch.compile compatibility and throughput.
 
 ## Issue Log
 

@@ -86,6 +86,27 @@ def main():
     parser.add_argument("--norm-before-residual", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--embed-requires-grad", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--noise-std", type=float, default=0.05)
+    # Architecture overrides (for draft model different from verifier)
+    parser.add_argument(
+        "--override-num-attention-heads", type=int, default=None,
+        help="Override num_attention_heads in draft transformer layer config",
+    )
+    parser.add_argument(
+        "--override-intermediate-size", type=int, default=None,
+        help="Override intermediate_size in draft transformer layer config",
+    )
+    parser.add_argument(
+        "--override-rope-theta", type=float, default=None,
+        help="Override rope_theta in draft transformer layer config",
+    )
+    parser.add_argument(
+        "--draft-vocab-size", type=int, default=None,
+        help="Override draft vocab size (default: verifier vocab size)",
+    )
+    parser.add_argument("--d2t-path", type=str, default=None,
+        help="Path to draft-to-target vocab mapping (npy)")
+    parser.add_argument("--t2d-path", type=str, default=None,
+        help="Path to target-to-draft vocab mapping (npy)")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -100,10 +121,27 @@ def main():
     )
     if hasattr(verifier_config, "text_config"):
         verifier_config = verifier_config.text_config
-    draft_vocab_size = verifier_config.vocab_size
+    draft_vocab_size = args.draft_vocab_size or verifier_config.vocab_size
+
+    # Load vocab mappings if provided
+    t2d = None
+    d2t = None
+    if args.t2d_path:
+        import numpy as np
+        t2d = torch.from_numpy(np.load(args.t2d_path))
+        if rank == 0:
+            root_logger.info(f"Loaded t2d mapping: {t2d.shape}")
+    if args.d2t_path:
+        import numpy as np
+        d2t = torch.from_numpy(np.load(args.d2t_path))
+        if rank == 0:
+            root_logger.info(f"Loaded d2t mapping: {d2t.shape}")
 
     transformer_layer_config = create_transformer_layer_config(
-        args.verifier_name_or_path, args.num_layers, draft_arch=args.draft_arch
+        args.verifier_name_or_path, args.num_layers, draft_arch=args.draft_arch,
+        override_num_attention_heads=args.override_num_attention_heads,
+        override_intermediate_size=args.override_intermediate_size,
+        override_rope_theta=args.override_rope_theta,
     )
 
     if SpeculatorModel.registry_auto_discovery:
@@ -123,6 +161,9 @@ def main():
     num_val = min(num_val, args.max_val_files)
     num_train = len(shuffled) - num_val
     val_files = shuffled[num_train:]
+
+    # Filter out files that don't exist on disk (partial sync)
+    val_files = [f for f in val_files if os.path.exists(f)]
 
     if rank == 0:
         root_logger.info(f"Validation set: {len(val_files)} files")
@@ -151,12 +192,13 @@ def main():
             root_logger.info(f"Evaluating checkpoint {ckpt_epoch}")
 
         # Create fresh model and apply FSDP
+        model_args = vars(args).copy()
+        model_args["draft_vocab_size"] = draft_vocab_size
         model = model_class.from_training_args(
             verifier_config=transformer_layer_config,
-            t2d=None,
-            d2t=None,
-            draft_vocab_size=draft_vocab_size,
-            **vars(args),
+            t2d=t2d,
+            d2t=d2t,
+            **model_args,
         )
         apply_fully_sharded(model)
 

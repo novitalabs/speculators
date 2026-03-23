@@ -104,7 +104,12 @@ def setup_dataloader(
 
 
 def create_transformer_layer_config(
-    verifier_name_or_path: str, num_layers: int, draft_arch: str = "llama"
+    verifier_name_or_path: str,
+    num_layers: int,
+    draft_arch: str = "llama",
+    override_num_attention_heads: int | None = None,
+    override_intermediate_size: int | None = None,
+    override_rope_theta: float | None = None,
 ) -> PretrainedConfig:
     if draft_arch not in DRAFT_ARCH_CONFIGS:
         raise ValueError(
@@ -123,18 +128,24 @@ def create_transformer_layer_config(
     )
     if hasattr(verifier_config, "text_config"):
         verifier_config = verifier_config.text_config
+
+    num_attention_heads = override_num_attention_heads or verifier_config.num_attention_heads
+    intermediate_size = override_intermediate_size or verifier_config.intermediate_size
+    rope_theta = override_rope_theta or getattr(verifier_config, "rope_theta", 10000.0)
+
     transformer_layer_config = config_class(
         vocab_size=verifier_config.vocab_size,
         hidden_size=verifier_config.hidden_size,
-        intermediate_size=verifier_config.intermediate_size,
+        intermediate_size=intermediate_size,
         num_hidden_layers=num_layers,
-        num_attention_heads=verifier_config.num_attention_heads,
+        num_attention_heads=num_attention_heads,
         num_key_value_heads=verifier_config.num_key_value_heads,
         hidden_act=verifier_config.hidden_act,
         max_position_embeddings=verifier_config.max_position_embeddings,
         initializer_range=verifier_config.initializer_range,
         rms_norm_eps=verifier_config.rms_norm_eps,
         head_dim=getattr(verifier_config, "head_dim", None),
+        rope_theta=rope_theta,
     )
     transformer_layer_config._attn_implementation = "simple_flex_attention"  # noqa: SLF001
     return transformer_layer_config
@@ -197,7 +208,12 @@ def main(args: argparse.Namespace):
         draft_vocab_size = verifier_config.vocab_size
 
     transformer_layer_config = create_transformer_layer_config(
-        args.verifier_name_or_path, args.num_layers, draft_arch=args.draft_arch
+        args.verifier_name_or_path,
+        args.num_layers,
+        draft_arch=args.draft_arch,
+        override_num_attention_heads=args.override_num_attention_heads,
+        override_intermediate_size=args.override_intermediate_size,
+        override_rope_theta=args.override_rope_theta,
     )
 
     if SpeculatorModel.registry_auto_discovery:
@@ -440,6 +456,20 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=12)
     parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--noise-std", type=float, default=0.05)
+
+    # Architecture overrides (for draft model different from verifier)
+    parser.add_argument(
+        "--override-num-attention-heads", type=int, default=None,
+        help="Override num_attention_heads for draft model (default: use verifier's value)",
+    )
+    parser.add_argument(
+        "--override-intermediate-size", type=int, default=None,
+        help="Override intermediate_size for draft model (default: use verifier's value)",
+    )
+    parser.add_argument(
+        "--override-rope-theta", type=float, default=None,
+        help="Override rope_theta for draft model (default: use verifier's value)",
+    )
 
     # Streaming-specific args
     parser.add_argument(

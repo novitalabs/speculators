@@ -185,6 +185,10 @@ print(f'Marked manifest complete with total_remote_files={total_remote}')
 
 echo "Starting sync loop: ${NODES[*]} -> $LOCAL_DIR (every ${POLL_INTERVAL}s, target_train_count=${TARGET_TRAIN_COUNT})"
 
+# Bootstrap manifest from any existing local files so training can start
+# while the first (potentially slow) rsync is still running.
+update_manifest
+
 while true; do
     all_complete=true
 
