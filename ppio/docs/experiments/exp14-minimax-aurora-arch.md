@@ -35,7 +35,7 @@ Exp13 checkpoint 60 achieved higher acceptance rate than Aurora (55.3% vs 48.7% 
   - Draft vocab: 200064 → 32000 (with d2t/t2d mapping from token frequency)
   - rope_theta: 10000 (LlamaConfig default, bug) → 5000000 (verifier's actual value)
   - New output path: `minimax_m2.5_eagle3_aurora_arch`
-- **Status**: EVAL COMPLETE — training continuing on .18 (epoch 150+), best checkpoints identified
+- **Status**: COMPLETE — training stopped at epoch 208, best checkpoints identified
 - **Outcome**: Exp14 ckpt54 beats Aurora-Spec on all metrics: 1.14x vs 1.07x speedup, 52.7% vs 46.2% Acc@0, torch.compile fully compatible
 - **Retained Checkpoints**: 49, 54, 59, 62, 65, 68 (others deleted to free disk)
 
@@ -124,25 +124,39 @@ Deleted all checkpoints except **49, 54, 59, 62, 65, 68** on both .17 and .18.
 - .17: 111GB → 9.6GB + removed 1.3TB gen data
 - Rationale: retained checkpoints cover the best-performing range with good spacing; ckpt 54 is best for inference throughput, ckpt 49/65 are best for offline val metrics
 
-### Training Continuation (epoch 68-153+, 2026-03-21 to 2026-03-23)
+### Training Continuation (epoch 68-208, 2026-03-21 to 2026-03-24)
 
-Training continued on .18 past the initial eval checkpoint range. New checkpoints 69-152 were generated but cleaned up during the 2026-03-23 cleanup (retained only 49/54/59/62/65/68 plus new ckpts 151/152).
+Training continued on .18 past the initial eval checkpoint range. Total runtime ~5 days.
 
-**Streaming val loss epoch 68-153** (sampled):
+**Streaming val metrics epoch 68-208** (sampled, unstable due to buffer rotation):
 
 | Epoch | val/loss | val/loss_0 | val/full_acc_0 |
 |-------|----------|-----------|---------------|
-| 98 | **2.942** | **0.513** | **82.1%** |
-| 128 | **2.944** | 0.518 | 80.5% |
-| 153 | 3.236 | 0.543 | 81.5% |
+| 70 | 3.234 | 0.557 | 79.3% |
+| 80 | 3.380 | 0.578 | 79.3% |
+| 90 | 3.306 | 0.577 | 81.2% |
+| **98** | **2.942** | **0.513** | **82.1%** |
+| 100 | 3.156 | 0.542 | 79.8% |
+| 110 | 3.335 | 0.567 | 79.2% |
+| 120 | 3.002 | 0.523 | 80.3% |
+| **128** | **2.944** | **0.518** | 80.5% |
+| 140 | 3.195 | 0.549 | 81.3% |
+| 150 | 3.347 | 0.566 | 79.3% |
+| 160 | 3.057 | 0.524 | 80.4% |
+| 170 | 3.277 | 0.562 | 79.5% |
+| 180 | 3.168 | 0.533 | 80.3% |
+| 190 | 3.202 | 0.546 | 81.8% |
+| 200 | 3.013 | 0.514 | 80.7% |
+| 208 | 3.112 | 0.520 | 82.0% |
 
-**Conclusion**: No meaningful improvement past epoch 65. Streaming val loss oscillates 2.94-3.41 due to buffer rotation, best points (epoch 98/128) are likely favorable val set compositions rather than real improvement. Offline eval (fixed set) confirmed ckpt 49-65 is the optimal range. **Training should be stopped.**
+**Conclusion**: 140 extra epochs (68→208) with no meaningful improvement. Streaming val loss oscillates 2.94-3.41 due to buffer rotation; best points (epoch 98/128/200) are favorable val set compositions, not real improvement. Offline eval (fixed set) confirmed ckpt 49-65 is the optimal range. **Training stopped at epoch 208 on 2026-03-24.**
 
 ### Next Steps
 
-1. Stop training on .18 — no further improvement expected
+1. ~~Stop training on .18~~ — done (2026-03-24)
 2. Run extended inference eval on ckpt 49 and 65 (offline eval winners) to see if they beat ckpt 54's throughput
 3. Package best checkpoint (likely ckpt 54 for throughput) for production deployment
+4. Compare Exp14 vs Exp15 (ckpt67, novita20260320 data) — Exp15 shows higher Acc@0 (63.2% vs 52.7%)
 
 ## Issue Log
 
