@@ -136,13 +136,29 @@ Evaluated on [ZClawBench](https://huggingface.co/datasets/zai-org/ZClawBench) �
 - Agent scenario Acc@0 much lower than chat across all models (39.6% vs 63.2% for Exp15) due to structured output (tool calls, code)
 - **Larger training dataset pays off** — Exp15 (114K novita0320) > Exp14 (52K novita0309) on agent tasks too
 
-### Cross-benchmark comparison
+### ZClawBench Eval on M2.1 (2026-03-25, .18, TP=4, 116 agent prompts × 512 tokens)
 
-| Model | Novita Speedup | ZClawBench Speedup | Novita Acc@0 | ZClawBench Acc@0 |
-|-------|---------------|-------------------|-------------|-----------------|
-| Aurora-Spec | 0.95x | 0.92x | 49.4% | 29.8% |
-| Exp14 ckpt54 | 1.14x | 1.02x | 52.7% | 34.1% |
-| **Exp15 ckpt67** | **1.01x** | **1.05x** | **63.2%** | **39.6%** |
+Cross-model test: draft models trained for M2.5, evaluated on M2.1 as base model.
+
+| Model | Tokens/s | Speedup | Acc Len | Acc@0 | Acc@1 | Acc@2 |
+|-------|----------|---------|---------|-------|-------|-------|
+| baseline (M2.1) | 237.1 | 1.00x | — | — | — | — |
+| Aurora-Spec (M2.1 native) | 209.0 | 0.88x | 1.377 | 23.3% | 9.9% | 4.6% |
+| Exp14 ckpt54 (M2.5 trained) | 225.4 | 0.95x | 1.432 | 30.9% | 9.3% | 3.0% |
+| **Exp15 ckpt67** (M2.5 trained) | **231.4** | **0.98x** | **1.513** | **35.4%** | **11.8%** | **4.1%** |
+
+**Key findings (M2.1)**:
+- Exp15 ckpt67 nearly matches baseline on M2.1 (0.98x), best among all draft models
+- Aurora-Spec, even on its native M2.1, slows inference on agent prompts (0.88x)
+- Exp15 transfers well across models: 35.4% Acc@0 on M2.1 vs 39.6% on M2.5
+
+### Cross-benchmark comparison (all on ZClawBench agent prompts)
+
+| Draft Model | M2.5 Speedup | M2.1 Speedup | M2.5 Acc@0 | M2.1 Acc@0 |
+|-------------|-------------|-------------|-----------|-----------|
+| Aurora-Spec (M2.1 native) | 0.92x | 0.88x | 29.8% | 23.3% |
+| Exp14 ckpt54 (M2.5 trained) | 1.02x | 0.95x | 34.1% | 30.9% |
+| **Exp15 ckpt67 (M2.5 trained)** | **1.05x** | **0.98x** | **39.6%** | **35.4%** |
 
 ## Next Steps
 

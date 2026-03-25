@@ -100,6 +100,21 @@ Evaluated on [ZClawBench](https://huggingface.co/datasets/zai-org/ZClawBench) �
 - **Aurora-Spec slows down inference** on agent prompts (0.92x) — Acc@0 only 29.8%, spec overhead exceeds benefit
 - **Exp14 ckpt54 achieves net speedup** (1.02x) with 34.1% Acc@0, +4.3pp over Aurora
 - Agent scenario Acc@0 much lower than chat (34.1% vs 52.7%) due to structured output (tool calls, code) being harder to predict
+
+### ZClawBench Eval on M2.1 (2026-03-25, .18, TP=4, 116 agent prompts × 512 tokens)
+
+Cross-model test: draft models trained for M2.5, evaluated on M2.1 as base model.
+
+| Model | Tokens/s | Speedup | Acc Len | Acc@0 | Acc@1 | Acc@2 |
+|-------|----------|---------|---------|-------|-------|-------|
+| baseline (M2.1) | 237.1 | 1.00x | — | — | — | — |
+| Aurora-Spec (M2.1 native) | 209.0 | 0.88x | 1.377 | 23.3% | 9.9% | 4.6% |
+| **Exp14 ckpt54** (M2.5 trained) | **225.4** | **0.95x** | 1.432 | 30.9% | 9.3% | 3.0% |
+
+**Key findings (M2.1)**:
+- Aurora-Spec, designed for M2.1, still slows inference on agent prompts (0.88x)
+- Exp14 ckpt54 (trained for M2.5) transfers to M2.1 reasonably well: 30.9% Acc@0 (+7.6pp vs Aurora)
+- All draft models slower than baseline on M2.1 + ZClawBench — agent task spec decode remains challenging
 - See Exp15 for better results with larger dataset (39.6% Acc@0, 1.05x speedup)
 - **torch.compile fully compatible**: Eagle3 head compilation took only 6.2s (same as Aurora), confirming the architecture change works
 - **ckpt60 regresses slightly** vs ckpt54 — consistent with val loss overfitting trend
