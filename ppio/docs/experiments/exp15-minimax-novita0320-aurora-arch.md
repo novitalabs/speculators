@@ -118,9 +118,34 @@ Evaluated on .10 with TP=4, gpu_memory_utilization=0.95, vLLM v1, 10 Novita prom
 **Impact**: Eval failed with TP=8 (sharding error) and TP=4 at 0.85 utilization (OOM).
 **Fix**: Use TP=4 with gpu_memory_utilization=0.95.
 
+## ZClawBench Eval Results (2026-03-24, .18, TP=4, 116 agent prompts × 512 tokens)
+
+Evaluated on [ZClawBench](https://huggingface.co/datasets/zai-org/ZClawBench) — 116 real agent task prompts covering code, office tasks, data analysis, automation, security. Tests speculative decoding on out-of-distribution agent scenarios.
+
+| Model | Tokens/s | Speedup | Acc Len | Acc@0 | Acc@1 | Acc@2 |
+|-------|----------|---------|---------|-------|-------|-------|
+| baseline (no spec) | 215.3 | 1.00x | — | — | — | — |
+| Aurora-Spec-M2.1 | 198.7 | 0.92x | 1.465 | 29.8% | 11.8% | 5.0% |
+| Exp14 ckpt54 | 219.2 | 1.02x | 1.476 | 34.1% | 10.1% | 3.4% |
+| **Exp15 ckpt67** | **225.8** | **1.05x** | **1.589** | **39.6%** | **14.2%** | **5.1%** |
+
+**Key findings (ZClawBench)**:
+- **Exp15 ckpt67 is the best model on agent tasks** — 1.05x speedup, 39.6% Acc@0
+- **Aurora-Spec slows down inference** on agent prompts (0.92x) — Acc@0 only 29.8%
+- **Exp15 beats Aurora by +9.8pp Acc@0** and turns a 0.92x slowdown into a 1.05x speedup
+- Agent scenario Acc@0 much lower than chat across all models (39.6% vs 63.2% for Exp15) due to structured output (tool calls, code)
+- **Larger training dataset pays off** — Exp15 (114K novita0320) > Exp14 (52K novita0309) on agent tasks too
+
+### Cross-benchmark comparison
+
+| Model | Novita Speedup | ZClawBench Speedup | Novita Acc@0 | ZClawBench Acc@0 |
+|-------|---------------|-------------------|-------------|-----------------|
+| Aurora-Spec | 0.95x | 0.92x | 49.4% | 29.8% |
+| Exp14 ckpt54 | 1.14x | 1.02x | 52.7% | 34.1% |
+| **Exp15 ckpt67** | **1.01x** | **1.05x** | **63.2%** | **39.6%** |
+
 ## Next Steps
 
 1. Run `eval_checkpoints.py` on more checkpoints (e.g., 56-67) with fixed val set to find the true best checkpoint
-2. Compare ckpt67 vs Exp14 best checkpoint directly
-3. Test with higher `num_speculative_tokens` (e.g., 5) to see if acceptance length scales
-4. Consider production deployment if throughput holds at scale
+2. Test with higher `num_speculative_tokens` (e.g., 5) to see if acceptance length scales
+3. Consider production deployment — Exp15 ckpt67 provides consistent speedup across both chat and agent workloads

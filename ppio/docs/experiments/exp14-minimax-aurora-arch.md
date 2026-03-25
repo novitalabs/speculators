@@ -83,8 +83,24 @@ Exp13 checkpoint 60 achieved higher acceptance rate than Aurora (55.3% vs 48.7% 
 | Exp14 ckpt60 | 76.2 | 1.09x | 1.860 | 48.2% | 25.2% | 12.6% |
 | Exp14 ckpt66 | 53.1 | 0.76x | 1.940 | 51.7% | 27.1% | 15.2% |
 
-**Key findings**:
+**Key findings (Novita)**:
 - **Exp14 ckpt54 beats Aurora-Spec on all metrics**: +6.5% Acc@0 (52.7% vs 46.2%), +10.7% acceptance length (1.945 vs 1.757), +6.6% throughput (79.9 vs 75.0 tok/s), 1.14x vs 1.07x speedup
+
+### ZClawBench Eval Results (2026-03-24, .18, TP=4, 116 agent prompts × 512 tokens)
+
+Evaluated on [ZClawBench](https://huggingface.co/datasets/zai-org/ZClawBench) — 116 real agent task prompts covering code, office tasks, data analysis, automation, security.
+
+| Model | Tokens/s | Speedup | Acc Len | Acc@0 | Acc@1 | Acc@2 |
+|-------|----------|---------|---------|-------|-------|-------|
+| baseline (no spec) | 215.3 | 1.00x | — | — | — | — |
+| Aurora-Spec-M2.1 | 198.7 | 0.92x | 1.465 | 29.8% | 11.8% | 5.0% |
+| **Exp14 ckpt54** | **219.2** | **1.02x** | 1.476 | 34.1% | 10.1% | 3.4% |
+
+**Key findings (ZClawBench)**:
+- **Aurora-Spec slows down inference** on agent prompts (0.92x) — Acc@0 only 29.8%, spec overhead exceeds benefit
+- **Exp14 ckpt54 achieves net speedup** (1.02x) with 34.1% Acc@0, +4.3pp over Aurora
+- Agent scenario Acc@0 much lower than chat (34.1% vs 52.7%) due to structured output (tool calls, code) being harder to predict
+- See Exp15 for better results with larger dataset (39.6% Acc@0, 1.05x speedup)
 - **torch.compile fully compatible**: Eagle3 head compilation took only 6.2s (same as Aurora), confirming the architecture change works
 - **ckpt60 regresses slightly** vs ckpt54 — consistent with val loss overfitting trend
 - **ckpt66 throughput anomaly**: Acc@0 is good (51.7%) but throughput dropped to 53.1 tok/s (0.76x) — possible CUDAGraph issue or transient system load, needs investigation
