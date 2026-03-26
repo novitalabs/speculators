@@ -113,10 +113,8 @@ def aurora_loss_function(
     """Aurora accept/discard loss: split KL into accepted and rejected positions.
 
     Accepted positions use standard KL. Rejected positions use KL with top-k
-    filtered target distribution.
+    filtered target distribution. Branch-free for torch.compile compatibility.
     """
-    device = logits.device
-
     # Compute accept/reject mask (no gradient through mask)
     draft_argmax = logits.detach().argmax(dim=-1)  # [B, S]
     target_argmax = targets.detach().argmax(dim=-1)  # [B, S]
@@ -129,49 +127,34 @@ def aurora_loss_function(
     else:
         rejected = ~accepted
 
-    num_accepted = accepted.sum().float()
-    num_rejected = rejected.sum().float()
+    accept_mask = accepted.float()  # [B, S]
+    reject_mask = rejected.float()  # [B, S]
+    num_accepted = accept_mask.sum()
+    num_rejected = reject_mask.sum()
     total = num_accepted + num_rejected + 1e-5
-    accept_ratio = num_accepted / total
 
     metrics: dict[str, torch.Tensor] = {
-        "aurora_accept_ratio": accept_ratio.detach(),
+        "aurora_accept_ratio": (num_accepted / total).detach(),
     }
 
     target_p = torch.nn.functional.softmax(targets, dim=-1)
     log_draft = torch.nn.functional.log_softmax(logits, dim=-1)
 
-    # --- Acceptance loss: standard KL on accepted positions ---
-    if num_accepted > 0:
-        accept_kl = torch.nn.functional.kl_div(
-            log_draft, target_p, reduction="none", log_target=False
-        )  # [B, S, V]
-        accept_kl = (accept_kl.sum(dim=-1) * accepted.float()).sum() / (
-            num_accepted + 1e-5
-        )
-    else:
-        accept_kl = torch.tensor(0.0, device=device)
+    # --- Acceptance loss: standard KL on accepted positions (branch-free) ---
+    accept_kl = torch.nn.functional.kl_div(
+        log_draft, target_p, reduction="none", log_target=False
+    )  # [B, S, V]
+    accept_kl = (accept_kl.sum(dim=-1) * accept_mask).sum() / (num_accepted + 1e-5)
 
     # --- Discard loss: KL with top-k filtered target on rejected positions ---
-    if num_rejected > 0:
-        # Top-k filter on target distribution
-        topk_vals, topk_idx = target_p.topk(discard_top_k, dim=-1)  # [B, S, k]
-
-        # Re-normalize target over top-k support
-        topk_target = topk_vals / (topk_vals.sum(dim=-1, keepdim=True) + 1e-10)
-
-        # Gather draft log-probs at same positions, then re-normalize
-        draft_logits_topk = logits.gather(-1, topk_idx)  # [B, S, k]
-        log_draft_topk = torch.nn.functional.log_softmax(draft_logits_topk, dim=-1)
-
-        discard_kl = torch.nn.functional.kl_div(
-            log_draft_topk, topk_target, reduction="none", log_target=False
-        )  # [B, S, k]
-        discard_kl = (discard_kl.sum(dim=-1) * rejected.float()).sum() / (
-            num_rejected + 1e-5
-        )
-    else:
-        discard_kl = torch.tensor(0.0, device=device)
+    topk_vals, topk_idx = target_p.topk(discard_top_k, dim=-1)  # [B, S, k]
+    topk_target = topk_vals / (topk_vals.sum(dim=-1, keepdim=True) + 1e-10)
+    draft_logits_topk = logits.gather(-1, topk_idx)  # [B, S, k]
+    log_draft_topk = torch.nn.functional.log_softmax(draft_logits_topk, dim=-1)
+    discard_kl = torch.nn.functional.kl_div(
+        log_draft_topk, topk_target, reduction="none", log_target=False
+    )  # [B, S, k]
+    discard_kl = (discard_kl.sum(dim=-1) * reject_mask).sum() / (num_rejected + 1e-5)
 
     loss = accept_kl + lambda_discard * discard_kl
 
