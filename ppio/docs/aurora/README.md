@@ -6,7 +6,7 @@
 
 | Phase | 目标 | 状态 | 文档 |
 |-------|------|------|------|
-| **Phase 1** | 离线 Aurora Loss 验证 | 🟢 训练中 (Exp16) | [phase1-dynamic-loss.md](phase1-dynamic-loss.md) |
+| **Phase 1** | 离线 Aurora Loss 验证 | ✅ 训练完成，待 eval | [phase1-dynamic-loss.md](phase1-dynamic-loss.md) |
 | **Phase 2** | 在线闭环（文件系统） | ⬜ 待定 | [phase2-online-loop.md](phase2-online-loop.md) |
 | **Phase 3** | 优化版在线系统 | ⬜ 待定 | [phase3-optimized.md](phase3-optimized.md) |
 
@@ -36,4 +36,4 @@ Phase 1 先验证这个 loss 改进是否有效（离线模式），再决定是
 |------|------|------|
 | Exp14 | Aurora 架构 + 标准 KL (52K data) | 52.7% Acc@0, 1.14x |
 | Exp15 | Aurora 架构 + 标准 KL (114K data) | 63.2% Acc@0, 1.01x |
-| **Exp16** | Aurora 架构 + Aurora Loss (同 Exp15 data) | 训练中... |
+| **Exp16** | Aurora 架构 + Aurora Loss (同 Exp15 data) | ✅ 完成, best ckpt53 (val/loss=1.073, Acc@0=58.0%) |

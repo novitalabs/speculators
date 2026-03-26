@@ -100,16 +100,42 @@ discard_kl = (kl_topk.sum(-1) * reject_mask).sum() / (num_rejected + 1e-5)
 | `val/loss_epoch` | 总验证 loss | 对比 Exp15 |
 | `val/full_acc_0_epoch` | 验证集准确率 | 对比 Exp15 |
 
-### 训练进展
+### 训练结果
+
+**状态**: ✅ 完成 — 70 epochs, 3.5 小时 (08:06–11:29 UTC, 2026-03-26)
 
 | Epoch | val/loss | accept_ratio_0 | full_acc_0 | Notes |
 |-------|---------|----------------|------------|-------|
-| 0 | 1.412 | 0.118 | 0.118 | 初始，模型未训练 |
+| 0 | 1.412 | 0.118 | 0.118 | 初始 |
 | 5 | 1.259 | 0.442 | 0.442 | 快速提升 |
-| 10 | 1.188 | 0.509 | 0.509 | accept_ratio 过 50% |
+| 10 | 1.188 | 0.509 | 0.509 | accept_ratio > 50% |
 | 15 | 1.145 | 0.552 | 0.552 | |
 | 20 | 1.132 | 0.552 | 0.552 | |
-| 23 | 1.116 | 0.563 | 0.563 | 训练中... |
+| 30 | 1.109 | 0.558 | 0.558 | |
+| 40 | 1.093 | 0.566 | 0.566 | |
+| 50 | 1.088 | 0.575 | 0.575 | |
+| **53** | **1.073** | **0.580** | **0.580** | **最佳 val/loss** |
+| 60 | 1.088 | 0.568 | 0.568 | 轻微过拟合 |
+| 69 | 1.097 | 0.569 | 0.569 | 最终 epoch |
+
+### 最佳 checkpoint (ckpt53) 详细指标
+
+| 指标 | Step 0 | Step 1 | Step 2 |
+|------|--------|--------|--------|
+| accept_ratio | 0.580 | 0.440 | 0.365 |
+| accept_loss | 0.166 | 0.202 | 0.227 |
+| discard_loss | 1.417 | 1.594 | 1.762 |
+| loss | 0.308 | 0.362 | 0.403 |
+| full_acc | 0.580 | 0.372 | 0.244 |
+| cond_acc | 0.580 | 0.492 | 0.489 |
+
+### 关键发现
+
+1. **accept_ratio 稳定在 ~0.57-0.58** — 动态 mask 在预期范围内，训练信号有效
+2. **discard_loss >> accept_loss** (1.4 vs 0.17) — rejected 位置确实更难学习
+3. **cond_acc 在 step 1/2 维持 ~0.49** — discard loss 对后续步骤有帮助
+4. **val/loss 在 epoch 50 后趋于平稳**，最佳在 epoch 53，之后轻微过拟合
+5. **训练完全收敛** — train/loss 降至 0.039，lr 衰减至 1.45e-06
 
 ### 问题与修复
 
@@ -119,12 +145,10 @@ discard_kl = (kl_topk.sum(-1) * reject_mask).sum() / (num_rejected + 1e-5)
 
 ## 评估计划
 
-训练完成后：
-
-1. 选择 val/loss 最低的 checkpoint
+1. 选择 ckpt53 (最佳 val/loss)，同时测 ckpt50/ckpt55 作为对照
 2. 在 Novita eval set (10 prompts × 512 tokens) 上测 Acc@0 / throughput
 3. 在 ZClawBench (116 agent prompts) 上测 agent 场景
-4. 与 Exp15 ckpt67 (标准 KL) 对比
+4. 与 Exp15 ckpt67 (标准 KL, 63.2% Acc@0, 1.01x) 做 A/B 对比
 
 ## 下一步
 
