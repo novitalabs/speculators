@@ -444,6 +444,14 @@ def parse_args():
     parser.add_argument("--t2d-path", type=str, default=None)
     parser.add_argument("--ttt-steps", type=int, default=3)
     parser.add_argument("--ttt-step-loss-decay", type=float, default=1.0)
+    parser.add_argument(
+        "--aurora-loss", action="store_true", default=False,
+        help="Use Aurora accept/discard loss instead of standard KL",
+    )
+    parser.add_argument("--lambda-discard", type=float, default=0.1,
+                        help="Weight for discard loss in Aurora loss")
+    parser.add_argument("--discard-top-k", type=int, default=10,
+                        help="Top-k filter size for discard loss target distribution")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--deterministic-cuda", action="store_true", default=False)
     parser.add_argument("--use-off-policy-tokens", action="store_true", default=False)

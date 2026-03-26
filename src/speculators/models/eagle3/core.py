@@ -103,6 +103,84 @@ def loss_function(
     return batch_loss.mean()
 
 
+def aurora_loss_function(
+    logits: torch.Tensor,  # [B, S, draft_vocab_size]
+    targets: torch.Tensor,  # [B, S, draft_vocab_size]
+    loss_mask: torch.Tensor | None,  # [B, S]
+    lambda_discard: float = 0.1,
+    discard_top_k: int = 10,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Aurora accept/discard loss: split KL into accepted and rejected positions.
+
+    Accepted positions use standard KL. Rejected positions use KL with top-k
+    filtered target distribution.
+    """
+    device = logits.device
+
+    # Compute accept/reject mask (no gradient through mask)
+    draft_argmax = logits.detach().argmax(dim=-1)  # [B, S]
+    target_argmax = targets.detach().argmax(dim=-1)  # [B, S]
+    accepted = draft_argmax == target_argmax  # [B, S]
+
+    if loss_mask is not None:
+        valid = loss_mask.to(torch.bool)
+        accepted = accepted & valid
+        rejected = ~accepted & valid
+    else:
+        rejected = ~accepted
+
+    num_accepted = accepted.sum().float()
+    num_rejected = rejected.sum().float()
+    total = num_accepted + num_rejected + 1e-5
+    accept_ratio = num_accepted / total
+
+    metrics: dict[str, torch.Tensor] = {
+        "aurora_accept_ratio": accept_ratio.detach(),
+    }
+
+    target_p = torch.nn.functional.softmax(targets, dim=-1)
+    log_draft = torch.nn.functional.log_softmax(logits, dim=-1)
+
+    # --- Acceptance loss: standard KL on accepted positions ---
+    if num_accepted > 0:
+        accept_kl = torch.nn.functional.kl_div(
+            log_draft, target_p, reduction="none", log_target=False
+        )  # [B, S, V]
+        accept_kl = (accept_kl.sum(dim=-1) * accepted.float()).sum() / (
+            num_accepted + 1e-5
+        )
+    else:
+        accept_kl = torch.tensor(0.0, device=device)
+
+    # --- Discard loss: KL with top-k filtered target on rejected positions ---
+    if num_rejected > 0:
+        # Top-k filter on target distribution
+        topk_vals, topk_idx = target_p.topk(discard_top_k, dim=-1)  # [B, S, k]
+
+        # Re-normalize target over top-k support
+        topk_target = topk_vals / (topk_vals.sum(dim=-1, keepdim=True) + 1e-10)
+
+        # Gather draft log-probs at same positions, then re-normalize
+        draft_logits_topk = logits.gather(-1, topk_idx)  # [B, S, k]
+        log_draft_topk = torch.nn.functional.log_softmax(draft_logits_topk, dim=-1)
+
+        discard_kl = torch.nn.functional.kl_div(
+            log_draft_topk, topk_target, reduction="none", log_target=False
+        )  # [B, S, k]
+        discard_kl = (discard_kl.sum(dim=-1) * rejected.float()).sum() / (
+            num_rejected + 1e-5
+        )
+    else:
+        discard_kl = torch.tensor(0.0, device=device)
+
+    loss = accept_kl + lambda_discard * discard_kl
+
+    metrics["aurora_accept_loss"] = accept_kl.detach()
+    metrics["aurora_discard_loss"] = discard_kl.detach()
+
+    return loss, metrics
+
+
 def compute_metrics(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -110,6 +188,7 @@ def compute_metrics(
     prev_correct: torch.Tensor | None,
     ttt_step: int,
     ttt_step_loss_decay: float,
+    aurora_config: dict | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Compute metrics for a given ttt_step.
 
@@ -120,6 +199,8 @@ def compute_metrics(
         prev_correct: The previous correct predictions for the current ttt_step.
         ttt_step: The current ttt_step.
         ttt_step_loss_decay: The loss decay for the current ttt_step.
+        aurora_config: If set, use aurora accept/discard loss instead of standard KL.
+            Keys: lambda_discard (float), discard_top_k (int).
 
     Effects:
         Modifies prev_correct in place.
@@ -133,7 +214,20 @@ def compute_metrics(
         logits, targets, loss_mask, prev_correct, ttt_step
     )
     loss_weight = ttt_step_loss_decay**ttt_step
-    s_loss = loss_weight * loss_function(s_logits, s_targets, s_loss_mask)
+
+    if aurora_config is not None:
+        s_loss_raw, aurora_metrics = aurora_loss_function(
+            s_logits,
+            s_targets,
+            s_loss_mask,
+            lambda_discard=aurora_config["lambda_discard"],
+            discard_top_k=aurora_config["discard_top_k"],
+        )
+        s_loss = loss_weight * s_loss_raw
+        for k, v in aurora_metrics.items():
+            s_metrics[f"{k}_{ttt_step}"] = v
+    else:
+        s_loss = loss_weight * loss_function(s_logits, s_targets, s_loss_mask)
 
     s_full_acc, s_cond_acc = compute_accuracy(
         s_logits, s_targets, s_loss_mask, s_prev_correct
@@ -370,6 +464,7 @@ class Eagle3DraftModel(SpeculatorModel):
         use_off_policy_tokens: bool = False,
         **kwargs,
     ):
+        aurora_config = kwargs.pop("aurora_config", None)
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
 
@@ -458,6 +553,7 @@ class Eagle3DraftModel(SpeculatorModel):
                     prev_correct,
                     ttt_step,
                     ttt_step_loss_decay,
+                    aurora_config=aurora_config,
                 )
                 loss += s_loss
                 metrics.update(s_metrics)
@@ -548,14 +644,22 @@ class Eagle3DraftModel(SpeculatorModel):
         Returns:
             Tuple of (train_call_kwargs, val_call_kwargs)
         """
+        aurora_config = None
+        if kwargs.get("aurora_loss", False):
+            aurora_config = {
+                "lambda_discard": kwargs.get("lambda_discard", 0.1),
+                "discard_top_k": kwargs.get("discard_top_k", 10),
+            }
         train_kwargs = {
             "use_off_policy_tokens": kwargs["use_off_policy_tokens"],
             "ttt_steps": kwargs["ttt_steps"],
             "ttt_step_loss_decay": kwargs["ttt_step_loss_decay"],
+            "aurora_config": aurora_config,
         }
         val_kwargs = {
             "use_off_policy_tokens": False,
             "ttt_steps": kwargs["ttt_steps"],
             "ttt_step_loss_decay": kwargs["ttt_step_loss_decay"],
+            "aurora_config": aurora_config,
         }
         return train_kwargs, val_kwargs
