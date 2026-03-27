@@ -99,10 +99,13 @@ Best candidates for eval: **ckpt53** (best val/loss), ckpt50, ckpt55 (nearby).
 |-------|----------|---------|---------|-------|-------|-------|
 | baseline (no spec) | 960.7 | 1.00x | — | — | — | — |
 | Aurora-Spec-M2.1 | 622.4 | 0.65x | 1.466 | 29.4% | 12.1% | 5.1% |
+| Aurora-Spec-M2.5 | 224.8 | 0.23x | 1.544 | 32.9% | 14.7% | 6.8% |
 | Exp15 ckpt67 (standard KL) | **688.3** | **0.72x** | **1.597** | **40.2%** | **14.4%** | **5.1%** |
-| **Exp16 ckpt53 (Aurora loss)** | 569.1 | 0.59x | 1.431 | 31.7% | 8.8% | 2.6% |
+| Exp16 ckpt53 (Aurora loss) | 569.1 | 0.59x | 1.431 | 31.7% | 8.8% | 2.6% |
 
 Note: baseline throughput is unusually high (960 tok/s) due to vLLM torch.compile cache hit from prior eval in same session. All spec decode models slower than baseline in this high-throughput regime, but relative comparison remains valid.
+
+**Aurora-Spec-M2.5** (togethercomputer/Aurora-Spec-Minimax-M2.5, 5.1GB) performed poorly at 0.23x despite having higher Acc@0 (32.9%) than Aurora-Spec-M2.1. The 3x larger draft model size creates excessive overhead that negates any acceptance rate gains. The eval was run separately (2026-03-27) so the baseline throughput may differ from the main eval session.
 
 ## A/B Conclusion: Aurora Loss vs Standard KL
 

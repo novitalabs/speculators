@@ -156,9 +156,12 @@ Cross-model test: draft models trained for M2.5, evaluated on M2.1 as base model
 
 | Draft Model | M2.5 Speedup | M2.1 Speedup | M2.5 Acc@0 | M2.1 Acc@0 |
 |-------------|-------------|-------------|-----------|-----------|
-| Aurora-Spec (M2.1 native) | 0.92x | 0.88x | 29.8% | 23.3% |
-| Exp14 ckpt54 (M2.5 trained) | 1.02x | 0.95x | 34.1% | 30.9% |
-| **Exp15 ckpt67 (M2.5 trained)** | **1.05x** | **0.98x** | **39.6%** | **35.4%** |
+| Aurora-Spec-M2.1 (1.7GB) | 0.92x | 0.88x | 29.8% | 23.3% |
+| Aurora-Spec-M2.5 (5.1GB) | 0.23x* | — | 32.9% | — |
+| Exp14 ckpt54 (1.7GB) | 1.02x | 0.95x | 34.1% | 30.9% |
+| **Exp15 ckpt67 (1.7GB)** | **1.05x** | **0.98x** | **39.6%** | **35.4%** |
+
+*Aurora-Spec-M2.5 throughput (224.8 tok/s) measured in a separate session with different baseline (960.7 tok/s vs 215.3). The 3x larger model size creates excessive spec decode overhead despite slightly better Acc@0 than M2.1 version.
 
 ## Next Steps
 
