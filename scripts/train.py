@@ -51,6 +51,7 @@ def setup_dataloader(
     noise_std: float = 0.05,
     num_workers: int = 12,
     prefetch_factor: int = 4,
+    mask_dir: str | None = None,
 ) -> DataLoader:
     """Setup dataloader for training.
     Args:
@@ -78,6 +79,7 @@ def setup_dataloader(
         max_len=args.total_seq_len,
         transform=noise_transform,
         standardize_fn=standardize_fn,
+        mask_dir=mask_dir,
     )
     batch_sampler = MultipackDistributedBatchSamplerV2(
         batch_max_length=args.total_seq_len,
@@ -215,6 +217,7 @@ def main(args: argparse.Namespace):
     )
 
     # Setup dataloaders
+    mask_dir = args.mask_dir if getattr(args, "aurora_static_mask", False) else None
     train_files, val_files = split_files(args.data_path, ratio=0.9)
     train_loader = setup_dataloader(
         train_files,
@@ -224,6 +227,7 @@ def main(args: argparse.Namespace):
         noise_std=args.noise_std,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
+        mask_dir=mask_dir,
     )
     val_loader = setup_dataloader(
         val_files,
@@ -233,6 +237,7 @@ def main(args: argparse.Namespace):
         noise_std=args.noise_std,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
+        mask_dir=mask_dir,
     )
 
     # Get trainer kwargs from model class
@@ -305,6 +310,10 @@ def parse_args():
                         help="Weight for discard loss in Aurora loss")
     parser.add_argument("--discard-top-k", type=int, default=10,
                         help="Top-k filter size for discard loss target distribution")
+    parser.add_argument("--aurora-static-mask", action="store_true", default=False,
+                        help="Use precomputed static masks instead of dynamic mask")
+    parser.add_argument("--mask-dir", type=str, default=None,
+                        help="Directory with precomputed mask_<idx>.pt files")
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
     )

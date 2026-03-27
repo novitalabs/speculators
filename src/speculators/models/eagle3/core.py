@@ -109,16 +109,23 @@ def aurora_loss_function(
     loss_mask: torch.Tensor | None,  # [B, S]
     lambda_discard: float = 0.1,
     discard_top_k: int = 10,
+    static_accepted_mask: torch.Tensor | None = None,  # [B, S]
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Aurora accept/discard loss: split KL into accepted and rejected positions.
 
     Accepted positions use standard KL. Rejected positions use KL with top-k
     filtered target distribution. Branch-free for torch.compile compatibility.
+
+    If static_accepted_mask is provided, it is used instead of dynamically
+    computing accept/reject from logits vs targets (Phase 1.5 static masks).
     """
-    # Compute accept/reject mask (no gradient through mask)
-    draft_argmax = logits.detach().argmax(dim=-1)  # [B, S]
-    target_argmax = targets.detach().argmax(dim=-1)  # [B, S]
-    accepted = draft_argmax == target_argmax  # [B, S]
+    if static_accepted_mask is not None:
+        accepted = static_accepted_mask.to(torch.bool)
+    else:
+        # Compute accept/reject mask (no gradient through mask)
+        draft_argmax = logits.detach().argmax(dim=-1)  # [B, S]
+        target_argmax = targets.detach().argmax(dim=-1)  # [B, S]
+        accepted = draft_argmax == target_argmax  # [B, S]
 
     if loss_mask is not None:
         valid = loss_mask.to(torch.bool)
@@ -172,6 +179,7 @@ def compute_metrics(
     ttt_step: int,
     ttt_step_loss_decay: float,
     aurora_config: dict | None = None,
+    static_accepted_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Compute metrics for a given ttt_step.
 
@@ -184,6 +192,8 @@ def compute_metrics(
         ttt_step_loss_decay: The loss decay for the current ttt_step.
         aurora_config: If set, use aurora accept/discard loss instead of standard KL.
             Keys: lambda_discard (float), discard_top_k (int).
+        static_accepted_mask: If set, use precomputed static mask instead of
+            dynamic accept/reject computation. Shape: [B, total_seq_len].
 
     Effects:
         Modifies prev_correct in place.
@@ -198,6 +208,12 @@ def compute_metrics(
     )
     loss_weight = ttt_step_loss_decay**ttt_step
 
+    # Slice static mask to aligned length if provided
+    s_static_mask = None
+    if static_accepted_mask is not None:
+        aligned_len = s_logits.shape[1]
+        s_static_mask = static_accepted_mask[:, :aligned_len]
+
     if aurora_config is not None:
         s_loss_raw, aurora_metrics = aurora_loss_function(
             s_logits,
@@ -205,6 +221,7 @@ def compute_metrics(
             s_loss_mask,
             lambda_discard=aurora_config["lambda_discard"],
             discard_top_k=aurora_config["discard_top_k"],
+            static_accepted_mask=s_static_mask,
         )
         s_loss = loss_weight * s_loss_raw
         for k, v in aurora_metrics.items():
@@ -448,6 +465,7 @@ class Eagle3DraftModel(SpeculatorModel):
         **kwargs,
     ):
         aurora_config = kwargs.pop("aurora_config", None)
+        static_masks = {i: kwargs.pop(f"accepted_mask_{i}", None) for i in range(ttt_steps)}
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
 
@@ -537,6 +555,7 @@ class Eagle3DraftModel(SpeculatorModel):
                     ttt_step,
                     ttt_step_loss_decay,
                     aurora_config=aurora_config,
+                    static_accepted_mask=static_masks[ttt_step],
                 )
                 loss += s_loss
                 metrics.update(s_metrics)

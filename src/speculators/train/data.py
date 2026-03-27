@@ -122,6 +122,7 @@ class Eagle3SampleFileDataset(Dataset):
         transform: TransformTensors | None = None,
         hidden_states_dtype=torch.float,
         standardize_fn: StandardizeFnSig = standardize_data_v1,
+        mask_dir: str | None = None,
     ):
         """Initialize the Eagle3SampleFileDataset.
         Args:
@@ -135,6 +136,8 @@ class Eagle3SampleFileDataset(Dataset):
             transform: The transform to apply to the data.
             hidden_states_dtype: The dtype of the hidden states.
             standardize_fn: The function to standardize the data.
+            mask_dir: Directory with precomputed mask_<idx>.pt files for static
+                Aurora masks. If None, no masks are loaded.
 
             Note: datapath or file_list must be provided, but not both.
 
@@ -161,6 +164,7 @@ class Eagle3SampleFileDataset(Dataset):
         self.transform = transform
         self.standardize_fn = standardize_fn
         self.hidden_states_dtype = hidden_states_dtype
+        self.mask_dir = mask_dir
         self.approx_lengths = self._compute_approx_lengths()
 
     def __len__(self):
@@ -257,7 +261,18 @@ class Eagle3SampleFileDataset(Dataset):
             data = self.transform(data)
 
         # Note: shift_batch will reduce seq_len by 1
-        return shift_batch(data)
+        shifted = shift_batch(data)
+
+        # Load precomputed static masks if mask_dir is set
+        # Masks are stored in post-shift coordinates (length seq_len-1)
+        if self.mask_dir:
+            file_idx = Path(self.data[load_index]).stem.split("_")[-1]
+            mask_path = Path(self.mask_dir) / f"mask_{file_idx}.pt"
+            mask_data = torch.load(mask_path, mmap=True, weights_only=True, map_location="cpu")
+            for key in ("accepted_mask_0", "accepted_mask_1", "accepted_mask_2"):
+                shifted[key] = mask_data[key]
+
+        return shifted
 
 
 def create_collate_fn(max_len: int):
