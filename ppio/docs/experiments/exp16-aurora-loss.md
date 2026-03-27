@@ -93,8 +93,31 @@ Best candidates for eval: **ckpt53** (best val/loss), ckpt50, ckpt55 (nearby).
 **Root cause**: 5 files at end of Exp15 datagen were truncated (disk full on .28 during original generation).
 **Fix**: Identified and removed `data_118911.pt` through `data_118915.pt`. 6073 clean files remain.
 
-## Next Steps
+## Eval Results — ZClawBench (2026-03-26, .18, TP=4, 116 agent prompts × 512 tokens)
 
-1. **Eval ckpt53** on Novita eval set (10 prompts × 512 tokens) — compare Acc@0 / throughput vs Exp15 ckpt67
-2. **Eval on ZClawBench** (116 agent prompts) — test generalization to agent scenarios
-3. **A/B conclusion**: If Aurora loss beats standard KL → proceed to Phase 2 (online loop)
+| Model | Tokens/s | Speedup | Acc Len | Acc@0 | Acc@1 | Acc@2 |
+|-------|----------|---------|---------|-------|-------|-------|
+| baseline (no spec) | 960.7 | 1.00x | — | — | — | — |
+| Aurora-Spec-M2.1 | 622.4 | 0.65x | 1.466 | 29.4% | 12.1% | 5.1% |
+| Exp15 ckpt67 (standard KL) | **688.3** | **0.72x** | **1.597** | **40.2%** | **14.4%** | **5.1%** |
+| **Exp16 ckpt53 (Aurora loss)** | 569.1 | 0.59x | 1.431 | 31.7% | 8.8% | 2.6% |
+
+Note: baseline throughput is unusually high (960 tok/s) due to vLLM torch.compile cache hit from prior eval in same session. All spec decode models slower than baseline in this high-throughput regime, but relative comparison remains valid.
+
+## A/B Conclusion: Aurora Loss vs Standard KL
+
+**Standard KL (Exp15) wins decisively over Aurora accept/discard loss (Exp16)**:
+
+| Metric | Exp15 (KL) | Exp16 (Aurora loss) | Delta |
+|--------|-----------|-------------------|-------|
+| Acc@0 | 40.2% | 31.7% | **KL +8.5pp** |
+| Acc@1 | 14.4% | 8.8% | **KL +5.6pp** |
+| Acceptance length | 1.597 | 1.431 | **KL +0.166** |
+| Throughput | 688.3 | 569.1 | **KL +21%** |
+
+**Why Aurora loss underperformed**:
+1. Training data was small (6K files vs Exp15's full 118K) — Aurora loss may need more data to learn the accept/discard boundary effectively
+2. The dynamic mask (accept_ratio ~58%) may have been too aggressive for the small dataset, reducing effective training signal
+3. Lambda_discard=0.1 may have been too low to sufficiently improve rejected positions
+
+**Verdict**: Do NOT proceed to Phase 2 (online loop) with Aurora loss. Standard KL loss remains the better training objective. Future work could revisit with larger datasets or tuned hyperparameters.
