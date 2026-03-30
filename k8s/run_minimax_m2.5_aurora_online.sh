@@ -69,7 +69,8 @@ echo "============================================="
 
 mkdir -p "$OUTPUT_DIR"/{checkpoints,logs} "$VOCAB_DIR"
 
-cd /workspace/speculators
+SPECULATORS_DIR="${SPECULATORS_DIR:-/workspace/speculators}"
+cd "$SPECULATORS_DIR"
 
 ###############################################################################
 # Step 0: Ensure vocab mapping exists on both nodes
@@ -81,9 +82,10 @@ if [[ ! -f "$D2T_PATH" ]] || [[ ! -f "$T2D_PATH" ]]; then
     echo "[setup] Vocab mapping not found at $VOCAB_DIR"
     echo "[setup] Generating vocab mapping..."
     python scripts/build_vocab_mapping.py \
-        --verifier-name-or-path "$VERIFIER_NAME_OR_PATH" \
+        --token-freq-path ./token_freq.pt \
+        --target-model-path "$VERIFIER_NAME_OR_PATH" \
         --draft-vocab-size 32000 \
-        --output-dir "$VOCAB_DIR"
+        --output-path "$VOCAB_DIR"
 fi
 echo "[setup] Vocab mapping: $VOCAB_DIR"
 

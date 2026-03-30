@@ -212,6 +212,7 @@ ssh "$TRAIN_NODE" "
         --discard-top-k $DISCARD_TOP_K \
         --aurora-static-mask \
         --final-epochs $EPOCHS_PER_ROUND \
+        --min-samples $((FILES_PER_ROUND / 5)) \
         --d2t-path $REMOTE_VOCAB/d2t.npy \
         --t2d-path $REMOTE_VOCAB/t2d.npy \
         --override-num-attention-heads $OVERRIDE_NUM_ATTENTION_HEADS \

@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: aurora-online-smoke-train
+  labels:
+    app: speculators
+    task: aurora-online-smoke-train
+spec:
+  restartPolicy: Never
+  nodeName: "host-10-83-115-17"
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+
+  containers:
+    - name: train
+      image: speculators:v0.17.0
+      imagePullPolicy: IfNotPresent
+      command: ["bash", "/workspace/speculators/k8s/run_aurora_online_smoke_train.sh"]
+
+      env:
+        - name: HF_HUB_OFFLINE
+          value: "1"
+        - name: HF_HOME
+          value: "/data/hf_cache"
+        - name: LOCAL_TRAIN_ENV
+          value: "1"
+        - name: NCCL_DEBUG
+          value: "WARN"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        - name: LD_LIBRARY_PATH
+          value: "/lib/x86_64-linux-gnu:/usr/local/nvidia/lib64:/usr/local/cuda/lib64"
+
+      resources:
+        limits:
+          nvidia.com/gpu: "8"
+        requests:
+          nvidia.com/gpu: "8"
+          memory: "256Gi"
+          cpu: "64"
+
+      volumeMounts:
+        - name: data-volume
+          mountPath: /data
+        - name: speculators-code
+          mountPath: /workspace/speculators
+        - name: shm
+          mountPath: /dev/shm
+
+  volumes:
+    - name: data-volume
+      hostPath:
+        path: /data
+        type: Directory
+    - name: speculators-code
+      hostPath:
+        path: /data/tengwan/develop/speculators
+        type: Directory
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: "256Gi"
