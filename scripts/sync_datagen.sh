@@ -63,7 +63,10 @@ for fname in sorted(os.listdir(local_dir)):
     except ValueError:
         continue
     fpath = os.path.join(local_dir, fname)
-    size_bytes = os.path.getsize(fpath)
+    try:
+        size_bytes = os.path.getsize(fpath)
+    except OSError:
+        continue
     files.append({
         'idx': idx,
         'path': fname,
@@ -188,6 +191,21 @@ echo "Starting sync loop: ${NODES[*]} -> $LOCAL_DIR (every ${POLL_INTERVAL}s, ta
 # Bootstrap manifest from any existing local files so training can start
 # while the first (potentially slow) rsync is still running.
 update_manifest
+
+# Background manifest updater: keeps manifest in sync with local files
+# even while a long rsync is still running.
+MANIFEST_UPDATE_INTERVAL="${MANIFEST_UPDATE_INTERVAL:-30}"
+(
+    while true; do
+        sleep "$MANIFEST_UPDATE_INTERVAL"
+        update_manifest
+    done
+) &
+MANIFEST_UPDATER_PID=$!
+echo "[manifest-updater] PID=$MANIFEST_UPDATER_PID (every ${MANIFEST_UPDATE_INTERVAL}s)"
+
+# Cleanup on exit
+trap "kill $MANIFEST_UPDATER_PID 2>/dev/null" EXIT
 
 while true; do
     all_complete=true

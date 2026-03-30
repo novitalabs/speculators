@@ -107,7 +107,8 @@ DATAGEN_CMD="python scripts/data_generation_offline.py \
     --tensor-parallel-size $DATAGEN_TP \
     --gpu-memory-utilization 0.85 \
     --turn-dropout \
-    --batch-size 4"
+    --batch-size 4 \
+    --max-output-size-gb ${MAX_OUTPUT_SIZE_GB:-1024}"
 
 # Only add --max-samples if > 0 (0 means unlimited)
 if [ "$MAX_SAMPLES" -gt 0 ] 2>/dev/null; then

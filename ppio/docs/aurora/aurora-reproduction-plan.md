@@ -1,5 +1,8 @@
 # Aurora Reproduction Plan
 
+> **状态: ⛔ 已终止 (2026-03-30)**
+> Phase 1/1.5 实验完成，Aurora accept/discard loss 在离线设置中未优于标准 KL 蒸馏（31.7% vs 63.2% Acc@0），Phase 2-3 已取消。当前最优路径：标准 KL + 大规模数据（Exp15/17）。
+
 基于 speculators 现有框架，使用 vLLM serving（非 sglang）实现 Aurora 论文的核心系统。
 
 ## 背景
@@ -34,7 +37,11 @@ Aurora 将投机解码建模为异步 RL 问题：推理端执行投机解码并
 
 ## 分阶段实施计划
 
-### Phase 1: 离线模拟验证（1-2 周）
+### Phase 1: 离线模拟验证（1-2 周） — ❌ 完成，未通过验证
+
+> **结果**: Exp16 实验表明 Aurora 动态 accept/discard loss (31.7% Acc@0) 大幅落后于标准 KL 蒸馏 (39.6% Acc@0)。详见 [Exp16](../experiments/exp16-aurora-loss.md) 和 [Phase 1 文档](phase1-dynamic-loss.md)。
+>
+> **Phase 1.5 补充**: 静态 mask 变体 (30.9% Acc@0) 同样落后。详见 [Phase 1.5 文档](phase1.5-static-mask.md)。
 
 **目标**: 用离线数据验证 Aurora 的训练算法（acceptance loss + discard sampling loss）是否优于纯 KL 蒸馏。
 
@@ -220,7 +227,9 @@ torchrun --nproc=8 scripts/train_aurora.py \
 
 ---
 
-### Phase 2: 简化版在线闭环（2-3 周）
+### Phase 2: 简化版在线闭环（2-3 周） — ⛔ 已取消
+
+> **原因**: Phase 1/1.5 核心 loss 未通过验证，在线闭环系统无需继续投入。
 
 **目标**: 实现基于文件系统的"穷人版"在线系统 — 推理端产生 trace 文件，训练端消费 trace 文件，新权重通过 checkpoint 回传。
 
@@ -429,7 +438,9 @@ def main():
 
 ---
 
-### Phase 3: 优化版在线系统（2-4 周）
+### Phase 3: 优化版在线系统（2-4 周） — ⛔ 已取消
+
+> **原因**: 同 Phase 2。
 
 **目标**: 在 Phase 2 基础上优化性能，接近论文描述的完整系统。
 
@@ -572,10 +583,17 @@ class LazySyncPolicy:
 
 ## 优先级建议
 
-**强烈建议从 Phase 1 开始**。理由：
+**~~强烈建议从 Phase 1 开始~~** — Phase 1 已完成，结果未达预期。
 
-1. **最小改动量**: Phase 1 主要是新增 ~300 行代码（trace 收集 + loss 扩展），不涉及系统架构变更
-2. **验证核心假设**: 如果 Aurora loss 在离线数据上不优于纯 KL 蒸馏，则无需投入 Phase 2-3 的系统工程
-3. **复用现有基础**: 训练端完全复用 `train_streaming.py`，数据端复用 `VllmHiddenStatesGenerator`
-4. **论文支撑**: Section 5 消融实验表明简单 RKL on-policy fine-tuning 已捕获大部分收益
-5. **快速迭代**: 1-2 周可出结果，指导后续投入方向
+### 实验结论 (2026-03-30)
+
+Aurora accept/discard loss 在离线设置中不优于标准 KL 蒸馏：
+
+| 方案 | Acc@0 | 结论 |
+|------|-------|------|
+| 标准 KL (Exp15, 114K 数据) | 63.2% | **最佳** |
+| 标准 KL (Exp16 baseline, 6K 数据) | 39.6% | baseline |
+| Aurora 动态 loss (Exp16) | 31.7% | -7.9pp |
+| Aurora 静态 mask loss (Exp16.5) | 30.9% | -8.7pp |
+
+**当前最优路径**: 标准 KL 蒸馏 + 大规模数据 + Aurora 架构 (24 heads)。后续工作聚焦 Exp17（novita0327 新数据集）。

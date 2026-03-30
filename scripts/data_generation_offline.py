@@ -22,6 +22,8 @@ Usage:
 import argparse
 import json
 import logging
+import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -175,6 +177,14 @@ def parse_args():
         help="Number of CPU processes for dataset preprocessing (default: 8)",
     )
 
+    # Buffer control
+    parser.add_argument(
+        "--max-output-size-gb",
+        type=float,
+        default=1024,
+        help="Max output directory size in GB. Pauses generation when exceeded (default: 1024)",
+    )
+
     # Online/streaming training support
     parser.add_argument(
         "--manifest-path",
@@ -214,6 +224,31 @@ def find_last_checkpoint(output_dir: str) -> int:
                 continue
 
     return max_index + 1
+
+
+def get_dir_size_gb(path: str) -> float:
+    """Get total size of files in a directory in GB (non-recursive, fast)."""
+    total = 0
+    try:
+        for entry in os.scandir(path):
+            if entry.is_file(follow_symlinks=False):
+                total += entry.stat().st_size
+    except OSError:
+        pass
+    return total / (1024**3)
+
+
+def wait_for_output_budget(output_dir: str, max_gb: float, poll_interval: int = 60):
+    """Block until output directory is under the size limit."""
+    while True:
+        size_gb = get_dir_size_gb(output_dir)
+        if size_gb < max_gb:
+            return
+        log.warning(
+            f"Output dir {size_gb:.1f}GB >= {max_gb:.0f}GB limit, "
+            f"waiting {poll_interval}s for space to free up..."
+        )
+        time.sleep(poll_interval)
 
 
 def save_sample_to_disk(data_dict, output_path):
@@ -301,6 +336,9 @@ def generate_and_save_hidden_states(args, dataset):
         futures = []
 
         for i in pbar:
+            if args.max_output_size_gb > 0:
+                wait_for_output_budget(args.output_dir, args.max_output_size_gb)
+
             batch_end = min(i + args.batch_size, num_samples)
             batch = dataset[i:batch_end]
             batch_input_ids = batch["input_ids"]

@@ -385,3 +385,34 @@ Aurora 的训练目标（KL 散度）与当前框架一致，且论文表明简�
 4. 当前框架的 `VllmHiddenStatesGenerator` 可以改造为执行投机解码并收集完整轨迹
 
 如果 Phase 1 验证了算法有效性，再逐步投入 Phase 2/3 的系统工程工作。
+
+---
+
+## 实验回顾 (2026-03 更新)
+
+Phase 1 离线验证已完成 (Exp16 + Exp16.5)，结论如下：
+
+### Aurora Loss 实验结果
+
+| 实验 | 方案 | Acc@0 | 对比 |
+|------|------|-------|------|
+| Exp15 (baseline) | 标准 KL 蒸馏 | 63.2% | — |
+| Exp16 (Phase 1) | Aurora 动态 accept/discard loss | 31.7% | -31.5pp |
+| Exp16.5 (Phase 1.5) | Aurora 静态 mask loss | 30.9% | -32.3pp |
+
+### 关键发现
+
+1. **Aurora accept/discard loss 在离线设置中不优于标准 KL 蒸馏** — 两种变体（动态 mask、静态 mask）均大幅落后于 baseline
+2. **标准 KL + 大规模数据仍是最优路径** — Exp15 (114K 数据 + 标准 KL) 达到 63.2% Acc@0，是目前最佳结果
+3. **Phase 2-3（在线闭环系统）已取消** — 核心 loss 未验证有效，无需投入系统工程
+
+### 状态更新
+
+| 阶段 | 状态 | 说明 |
+|------|------|------|
+| Phase 1: 离线 Aurora Loss | ❌ 完成 — 未通过验证 | Exp16: 动态 loss 落后 KL ~9pp |
+| Phase 1.5: 静态 Mask Loss | ❌ 完成 — 未通过验证 | Exp16.5: 静态 mask 同样落后 |
+| Phase 2: 文件系统在线闭环 | ⛔ 已取消 | Phase 1 未验证，无需继续 |
+| Phase 3: RPC 在线系统 | ⛔ 已取消 | 同上 |
+
+详见 [Aurora 实验文档](../aurora/) 和 [Exp16](../experiments/exp16-aurora-loss.md)。
