@@ -29,7 +29,9 @@ targeting vLLM inference acceleration.
 | [14](exp14-minimax-aurora-arch.md) | Aurora-like Architecture (24 heads) | MiniMax-M2.5 | Novita ~52K | 52.7% | COMPLETED |
 | [15](exp15-minimax-novita0320-aurora-arch.md) | Aurora-Arch + novita20260320 (114K) | MiniMax-M2.5 | Novita 114K | 63.2% | COMPLETED |
 | [16](exp16-aurora-loss.md) | Aurora Accept/Discard Loss | MiniMax-M2.5 | Novita 6K | 31.7% | COMPLETED |
-| [17](exp17-minimax-novita0327-aurora-arch.md) | Aurora-Arch + novita20260327 | MiniMax-M2.5 | Novita 0327 | - | IN PROGRESS |
+| [17](exp17-minimax-novita0327-aurora-arch.md) | Aurora-Arch + novita20260327 | MiniMax-M2.5 | Novita 0327 | 43.1% | STOPPED |
+| [18](exp18-minimax-merged-diversity.md) | Aurora-Arch + Merged Novita (session-dedup) | MiniMax-M2.5 | Merged 3x Novita | 60.4% | STOPPED |
+| [19](exp19-continuous-datagen.md) | Continuous Datagen + Difficulty Resampling | MiniMax-M2.5 | Merged 3x Novita | - | IN PROGRESS |
 
 *Domain-specific accuracy (coding agent conversations), not directly comparable.
 

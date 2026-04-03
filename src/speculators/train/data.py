@@ -260,6 +260,9 @@ class Eagle3SampleFileDataset(Dataset):
         if self.transform:
             data = self.transform(data)
 
+        # Track source file for per-sample loss feedback
+        data["_file_basename"] = Path(self.data[load_index]).name
+
         # Note: shift_batch will reduce seq_len by 1
         shifted = shift_batch(data)
 
@@ -277,6 +280,9 @@ class Eagle3SampleFileDataset(Dataset):
 
 def create_collate_fn(max_len: int):
     def collate_fn(batch: list[BatchType]) -> BatchType:
+        # Extract non-tensor metadata before collation
+        file_basenames = [b.pop("_file_basename", None) for b in batch]
+
         collated_data = {}
         for key in batch[0]:
             # Concatenate the tensors along the seq (0th) dimension
@@ -303,6 +309,11 @@ def create_collate_fn(max_len: int):
             new_lengths.append(length)
             cum_length += length
         collated_data["lengths"] = torch.tensor(new_lengths, dtype=torch.long)
+
+        # Preserve source file basenames for per-sample loss tracking
+        # Only keep basenames for samples that fit in the packed sequence
+        collated_data["_file_basenames"] = file_basenames[:len(new_lengths)]
+
         return collated_data
 
     return collate_fn

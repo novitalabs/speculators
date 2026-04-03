@@ -2,9 +2,10 @@
 set -euo pipefail
 
 ###############################################################################
-# Exp 17: MiniMax-M2.5 Novita0327 Aurora-Arch Training
-# Same Aurora architecture as Exp14/15, trained on weilan55/novita20260327.
-# Data synced from .12 via rsync.
+# Exp 18: MiniMax-M2.5 Merged Novita Training (session-dedup)
+# Same Aurora architecture as Exp14/15/17, trained on merged dataset with
+# session-level dedup (max 5 samples per unique task).
+# Data synced from datagen node via rsync.
 ###############################################################################
 
 export HF_HUB_OFFLINE=1
@@ -12,7 +13,7 @@ export HF_HOME=/data/hf_cache
 export LOCAL_TRAIN_ENV=1
 
 VERIFIER_NAME_OR_PATH="${MODEL_PATH:-/data/models/MiniMax-M2.5}"
-OUTPUT_PATH="${OUTPUT_PATH:-/data/output/minimax_m2.5_eagle3_novita0327}"
+OUTPUT_PATH="${OUTPUT_PATH:-/data/output/minimax_m2.5_eagle3_exp18}"
 NUM_GPUS="${NUM_GPUS:-8}"
 SEQ_LENGTH="${SEQ_LENGTH:-8192}"
 LR="${LR:-3e-5}"
@@ -25,7 +26,7 @@ TARGET_TRAIN_COUNT="${TARGET_TRAIN_COUNT:-10}"
 TARGET_GLOBAL_EPOCHS="${TARGET_GLOBAL_EPOCHS:-10}"
 VAL_EVERY_STEPS="${VAL_EVERY_STEPS:-500}"
 
-# Aurora architecture overrides (same as Exp14)
+# Aurora architecture overrides (same as Exp14/15/17)
 OVERRIDE_NUM_ATTENTION_HEADS="${OVERRIDE_NUM_ATTENTION_HEADS:-24}"
 OVERRIDE_INTERMEDIATE_SIZE="${OVERRIDE_INTERMEDIATE_SIZE:-8192}"
 OVERRIDE_ROPE_THETA="${OVERRIDE_ROPE_THETA:-5000000}"
@@ -33,11 +34,11 @@ DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
 
 GEN_DIR="$OUTPUT_PATH/gen"
 MANIFEST_PATH="$GEN_DIR/manifest.json"
-REMOTE_GEN_DIR="/data/output/minimax_m2.5_eagle3_novita0327/gen"
+REMOTE_GEN_DIR="/data/output/minimax_m2.5_eagle3_exp18/gen"
 VOCAB_DIR="$OUTPUT_PATH/vocab_mapping"
 
 echo "============================================="
-echo " Exp 17: MiniMax-M2.5 Novita0327 Aurora-Arch Training"
+echo " Exp 18: MiniMax-M2.5 Merged Novita Training"
 echo " Model:        $VERIFIER_NAME_OR_PATH"
 echo " Data:         $GEN_DIR"
 echo " Manifest:     $MANIFEST_PATH"
@@ -58,17 +59,14 @@ echo "============================================="
 
 mkdir -p "$OUTPUT_PATH"/{checkpoints,logs} "$GEN_DIR" "$VOCAB_DIR"
 
-# Ensure 'python' is available
 if ! command -v python &>/dev/null; then
     ln -s "$(command -v python3)" /usr/local/bin/python
 fi
 
-# Ensure hostname resolves (needed for torchrun with hostNetwork)
 if ! getent hosts "$(hostname)" &>/dev/null; then
     echo "127.0.0.1 $(hostname)" >> /etc/hosts
 fi
 
-# Install rsync and ssh client (not in vllm base image)
 if ! command -v rsync &>/dev/null; then
     echo "[setup] Installing rsync and openssh-client..."
     export http_proxy=http://127.0.0.1:1083 https_proxy=http://127.0.0.1:1083
@@ -80,7 +78,6 @@ cd /workspace/speculators
 
 ###############################################################################
 # Step 0: Generate vocab mapping (d2t/t2d) if not already present
-# Wait for token_freq.pt from datagen output, fallback to local copy
 ###############################################################################
 D2T_PATH="$VOCAB_DIR/d2t.npy"
 T2D_PATH="$VOCAB_DIR/t2d.npy"
@@ -88,7 +85,6 @@ T2D_PATH="$VOCAB_DIR/t2d.npy"
 if [ ! -f "$D2T_PATH" ] || [ ! -f "$T2D_PATH" ]; then
     TOKEN_FREQ_PATH="$GEN_DIR/token_freq.pt"
 
-    # Try to fetch token_freq.pt from datagen node if not available locally
     if [ ! -f "$TOKEN_FREQ_PATH" ]; then
         echo "[vocab] Waiting for token_freq.pt from datagen node ($DATAGEN_NODE)..."
         for i in $(seq 1 60); do
@@ -109,7 +105,7 @@ if [ ! -f "$D2T_PATH" ] || [ ! -f "$T2D_PATH" ]; then
         if [ -f "token_freq.pt" ]; then
             cp token_freq.pt "$TOKEN_FREQ_PATH"
         else
-            echo "[ERROR] No token_freq.pt available (neither remote nor local). Cannot build vocab mapping."
+            echo "[ERROR] No token_freq.pt available. Cannot build vocab mapping."
             exit 1
         fi
     fi
@@ -120,13 +116,13 @@ if [ ! -f "$D2T_PATH" ] || [ ! -f "$T2D_PATH" ]; then
         --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
         --target-vocab-size 200064 \
         --output-path "$VOCAB_DIR"
-    echo "[vocab] Done: d2t=$(python -c "import numpy as np; print(np.load('$D2T_PATH').shape)"), t2d=$(python -c "import numpy as np; print(np.load('$T2D_PATH').shape)")"
+    echo "[vocab] Done."
 else
     echo "[vocab] Reusing existing vocab mapping at $VOCAB_DIR"
 fi
 
 ###############################################################################
-# Background: rsync from datagen node (.12)
+# Background: rsync from datagen node
 ###############################################################################
 echo "[sync] Starting rsync loop from $DATAGEN_NODE..."
 bash scripts/sync_datagen.sh \
@@ -143,11 +139,8 @@ echo "[sync] PID=$SYNC_PID"
 
 ###############################################################################
 # Background: buffer cleanup (with epoch lock + safety limits)
-# Evicts most-trained files when gen dir exceeds BUFFER_MAX_SIZE_GB.
-# Protected by epoch lock (.epoch_in_progress), max-delete-per-cycle, and
-# min-retain-count to avoid deleting files training is actively reading.
 ###############################################################################
-echo "[cleanup] Starting buffer cleanup (max_delete=5000, min_retain=1000)..."
+echo "[cleanup] Starting buffer cleanup..."
 python scripts/buffer_cleanup.py \
     --manifest-path "$MANIFEST_PATH" \
     --data-dir "$GEN_DIR" \
@@ -187,13 +180,12 @@ torchrun \
     --override-num-attention-heads "$OVERRIDE_NUM_ATTENTION_HEADS" \
     --override-intermediate-size "$OVERRIDE_INTERMEDIATE_SIZE" \
     --override-rope-theta "$OVERRIDE_ROPE_THETA" \
-    --run-name "minimax_m2.5_eagle3_novita0327" \
+    --run-name "minimax_m2.5_eagle3_exp18" \
     2>&1 | tee "$TRAIN_LOG"
 
-# Kill background processes
-kill $SYNC_PID ${CLEANUP_PID:+$CLEANUP_PID} 2>/dev/null || true
+kill $SYNC_PID $CLEANUP_PID 2>/dev/null || true
 
 echo "============================================="
-echo " Exp 17 novita0327 Aurora-arch training complete!"
+echo " Exp 18 training complete!"
 echo " Checkpoints: $OUTPUT_PATH/checkpoints"
 echo "============================================="

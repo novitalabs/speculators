@@ -74,8 +74,14 @@ def cleanup_once(
     manifest = manifest_mod.read(manifest_path)
     all_files = list(manifest["files"])
 
-    # Sort ALL files by train_count desc, idx asc (evict most-trained first)
-    all_files.sort(key=lambda f: (-f.get("train_count", 0), f["idx"]))
+    # Sort by eviction priority: low difficulty (easy) + high train_count → evict first.
+    # Files without avg_loss are treated as medium priority (evict after easy files).
+    # This implements curriculum learning: keep hard samples longer.
+    all_files.sort(key=lambda f: (
+        f.get("avg_loss", float("inf")),   # low loss (easy) first; unknown → keep
+        -f.get("train_count", 0),           # among same difficulty: most-trained first
+        f["idx"],                           # tiebreak by oldest
+    ))
 
     # Read existing ledger for cumulative counts
     ledger = manifest_mod.read_ledger(data_dir)

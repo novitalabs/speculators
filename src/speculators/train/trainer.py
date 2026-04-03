@@ -43,6 +43,52 @@ class TrainerConfig(NamedTuple):
     val_every_steps: int = 0  # 0 = no mid-epoch validation
 
 
+class DifficultyTracker:
+    """Track per-file training loss with exponential moving average."""
+
+    def __init__(self, alpha: float = 0.1, write_interval: int = 100):
+        self.alpha = alpha
+        self.write_interval = write_interval
+        self.scores: dict[str, float] = {}  # file_basename → EMA loss
+        self.step_count = 0
+
+    def update(self, file_basenames: list[str], loss_value: float):
+        """Update EMA loss for each file in the batch."""
+        for name in file_basenames:
+            if name is None:
+                continue
+            if name in self.scores:
+                self.scores[name] = (
+                    self.alpha * loss_value + (1 - self.alpha) * self.scores[name]
+                )
+            else:
+                self.scores[name] = loss_value
+        self.step_count += 1
+
+    def should_write(self) -> bool:
+        return self.step_count % self.write_interval == 0
+
+    def write(self, path: str):
+        """Write difficulty scores to JSON file (atomic)."""
+        import json
+        import os
+        import tempfile
+
+        if not self.scores:
+            return
+        dir_name = os.path.dirname(path)
+        fd, tmp = tempfile.mkstemp(dir=dir_name, suffix=".json")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.scores, f)
+            os.rename(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 class Trainer:
     def __init__(
         self,
@@ -50,6 +96,7 @@ class Trainer:
         config: TrainerConfig,
         train_loader: DataLoader,
         val_loader: DataLoader | None = None,
+        difficulty_scores_path: str | None = None,
     ):
         self.model = model
         self.config = config
@@ -58,6 +105,8 @@ class Trainer:
         self.val_loader = val_loader
         self.is_distributed = config.is_distributed
         self.resume_from_checkpoint = config.resume_from_checkpoint
+        self.difficulty_tracker = DifficultyTracker()
+        self.difficulty_scores_path = difficulty_scores_path
         checkpointer_class = (
             DistributedCheckpointer if self.is_distributed else SingleGPUCheckpointer
         )
@@ -194,6 +243,13 @@ class Trainer:
                 extra={"step": self.global_step},
             )
             self.global_step += 1
+
+            # Track per-file difficulty for weighted resampling
+            file_basenames = batch.get("_file_basenames", [])
+            if file_basenames and self.difficulty_scores_path:
+                self.difficulty_tracker.update(file_basenames, loss.item())
+                if self.difficulty_tracker.should_write() and self.local_rank == 0:
+                    self.difficulty_tracker.write(self.difficulty_scores_path)
 
             if (self.config.val_every_steps > 0
                     and self.global_step % self.config.val_every_steps == 0

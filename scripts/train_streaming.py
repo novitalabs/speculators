@@ -303,7 +303,11 @@ def main(args: argparse.Namespace):
         scheduler_type="none",  # streaming: use constant lr
         val_every_steps=args.val_every_steps,
     )
-    trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
+    difficulty_scores_path = os.path.join(args.data_path, "difficulty_scores.json")
+    trainer = Trainer(
+        draft_model, trainer_config, train_loader, val_loader,
+        difficulty_scores_path=difficulty_scores_path,
+    )
 
     epoch = trainer.current_epoch
     final_countdown = args.final_epochs
@@ -355,6 +359,13 @@ def main(args: argparse.Namespace):
             f"global_epoch={global_epoch_count}"
         )
 
+        # Merge difficulty scores into manifest file entries
+        difficulty_scores = trainer.difficulty_tracker.scores
+        if difficulty_scores:
+            for f in manifest["files"]:
+                if f["path"] in difficulty_scores:
+                    f["avg_loss"] = round(difficulty_scores[f["path"]], 4)
+
         # Write progress to manifest
         extra = {k: v for k, v in manifest.items()
                  if k not in ("status", "files", "updated_at")}
@@ -368,8 +379,8 @@ def main(args: argparse.Namespace):
         )
 
         # Release epoch lock — cleanup can now safely delete trained files
-        Path(epoch_lock_path).unlink(missing_ok=True)
-        root_logger.info("Epoch lock released, waiting for cleanup + sync cycle...")
+        # NOTE: lock stays held until AFTER the new DataLoader is built below,
+        # so cleanup cannot delete files that the next epoch is about to use.
 
         epoch += 1
 
@@ -390,7 +401,11 @@ def main(args: argparse.Namespace):
                 break
 
         # Wait for cleanup to finish and sync to replenish files
-        # This ensures enough train files exist before rebuilding the DataLoader
+        # Release lock temporarily so cleanup can run, then re-acquire before
+        # rebuilding DataLoader to prevent race condition.
+        Path(epoch_lock_path).unlink(missing_ok=True)
+        root_logger.info("Epoch lock released, waiting for cleanup + sync cycle...")
+
         while True:
             time.sleep(args.poll_interval)
             manifest = manifest_mod.read(args.manifest_path)
@@ -405,6 +420,15 @@ def main(args: argparse.Namespace):
 
         if manifest["status"] == "complete":
             datagen_complete = True
+
+        # Re-acquire epoch lock BEFORE rebuilding DataLoader — this prevents
+        # cleanup from deleting files between manifest read and DataLoader init
+        Path(epoch_lock_path).write_text(str(epoch))
+
+        # Re-read manifest under lock to get a consistent snapshot
+        manifest = manifest_mod.read(args.manifest_path)
+        all_files = resolve_file_paths(args.data_path, manifest["files"])
+        train_files = [f for f in all_files if f not in val_file_set]
 
         # Rebuild train DataLoader with new files
         # Shutdown old workers first
@@ -421,6 +445,11 @@ def main(args: argparse.Namespace):
             mask_dir=mask_dir,
         )
         trainer.train_loader = train_loader
+
+        # NOW release epoch lock — DataLoader is rebuilt with fresh file list,
+        # cleanup can safely delete old files without causing FileNotFoundError
+        Path(epoch_lock_path).unlink(missing_ok=True)
+        root_logger.info("Epoch lock released after DataLoader rebuild.")
 
     root_logger.info("Streaming training complete!")
     maybe_destroy_distributed()

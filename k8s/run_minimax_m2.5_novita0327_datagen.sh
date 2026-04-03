@@ -96,6 +96,9 @@ echo "[Step 1] Total conversations: $(wc -l < "$NOVITA_JSONL")"
 
 ###############################################################################
 # Step 1: Generate training data
+# NOTE: data_generation_offline.py automatically runs a background cleanup
+# thread when --max-output-size-gb is set, evicting oldest files to stay
+# within the budget. No shell-level cleanup needed.
 ###############################################################################
 echo "[Step 1] Generating training data from Novita conversations..."
 DATAGEN_CMD="python scripts/data_generation_offline.py \

@@ -1,0 +1,281 @@
+# Experiment 19: Continuous Datagen with Difficulty-Weighted Resampling
+
+## Status: RUNNING (deployed 2026-04-03, datagen round 1 in progress)
+
+## Motivation
+
+Exp18 validated that session-level dedup is critical (60.4% Acc@0 vs Exp17's 43.1%), but exposed a fundamental pipeline flaw:
+
+1. **Datagen runs one pass and exits** — generates 165K samples, then stops
+2. **Buffer cleanup continuously evicts** — with 500GB buffer, old files are deleted before training uses them enough
+3. **90% data loss** — only 17K of 165K samples survived on .18; training overfit on a shrinking pool
+4. **No feedback loop** — all samples treated equally; easy/hard samples get the same generation frequency
+
+The root cause is that the pipeline was designed for a "generate once, train once" workflow, but effective Eagle3 training needs **continuous data refresh with intelligent resampling**.
+
+## Design
+
+### Core Principle
+
+```
+Datagen (continuous)  →  Buffer (prioritized)  →  Training (with loss feedback)
+     ↑                                                    │
+     └──────── difficulty scores (per-sample loss) ────────┘
+```
+
+### Component 1: Continuous Datagen Loop
+
+**File: `scripts/data_generation_offline.py`**
+
+Current behavior: iterate over dataset once → exit.
+
+New behavior: iterate over dataset in rounds, never exit.
+
+```python
+# Current (single-pass):
+for i in pbar:
+    generate_and_save(dataset[i])
+# exits here
+
+# New (continuous loop):
+round_num = 0
+while True:
+    round_num += 1
+    weights = load_difficulty_weights()  # from training feedback
+    sample_order = weighted_shuffle(dataset, weights, seed=round_num)
+
+    for i in sample_order:
+        wait_for_output_budget(...)  # existing budget control
+        generate_and_save(dataset[i])
+
+    log.info(f"Round {round_num} complete, starting next round...")
+```
+
+**Key changes:**
+- Add `--continuous` flag (default False for backward compat)
+- After each round, reload difficulty weights from a shared file
+- Round 1: uniform weights (ensure full coverage)
+- Round 2+: weight proportional to difficulty score
+- File naming: `data_{global_idx}.pt` with monotonically increasing index across rounds
+- Manifest status stays "generating" indefinitely (never "complete")
+
+### Component 2: Per-Sample Difficulty Tracking
+
+**Files: `src/speculators/train/trainer.py`, `src/speculators/models/eagle3/core.py`**
+
+Training already computes per-token KL divergence loss. Currently aggregated to a scalar. Need to:
+
+1. **Return per-sample loss from model forward**
+
+```python
+# In core.py loss_function():
+# Currently returns: batch_loss.mean()  (scalar)
+# Change to return: batch_loss  (shape [B])
+# Caller (trainer.py) handles averaging for backward, but also records per-sample values
+```
+
+2. **Track sample boundaries through packed batches**
+
+The collate function packs multiple samples into one sequence. Need to track which tokens belong to which source file.
+
+```python
+# In data.py collate_fn:
+# Currently returns: {"input_ids": [1, total_seq_len], ...}
+# Add: {"sample_boundaries": [(start, end, file_idx), ...]}
+```
+
+3. **Write per-file loss to a shared difficulty file**
+
+```python
+# In trainer.py, after each step:
+# Aggregate per-sample loss back to source files
+# Periodically write to: <data_dir>/difficulty_scores.json
+# Format: {"data_0.pt": 2.34, "data_1.pt": 0.87, ...}
+```
+
+**Update frequency**: Every N steps (e.g., 100) to avoid I/O overhead. Use exponential moving average to smooth across epochs.
+
+### Component 3: Difficulty-Weighted Resampling in Datagen
+
+**File: `scripts/data_generation_offline.py`**
+
+```python
+def load_difficulty_weights(data_dir, dataset_size, default_weight=1.0):
+    """Load per-conversation difficulty weights from training feedback."""
+    scores_path = os.path.join(data_dir, "difficulty_scores.json")
+    if not os.path.exists(scores_path):
+        return [default_weight] * dataset_size  # Round 1: uniform
+
+    scores = json.load(open(scores_path))
+    # Map .pt file scores back to conversation indices
+    # Higher loss → higher weight (resample more often)
+    weights = []
+    for i in range(dataset_size):
+        key = f"data_{i}.pt"
+        if key in scores:
+            weights.append(scores[key])
+        else:
+            weights.append(default_weight)  # unseen → default priority
+    return weights
+
+def weighted_shuffle(indices, weights, seed):
+    """Shuffle indices with probability proportional to weights."""
+    rng = random.Random(seed)
+    # Weighted sampling without replacement
+    return rng.choices(indices, weights=weights, k=len(indices))
+```
+
+**Difficulty-to-weight mapping:**
+- Normalize loss values to [0, 1] range
+- `weight = 0.5 + 0.5 * normalized_loss` — ensures easy samples still get some coverage (min 50% weight) but hard samples are 2x more likely
+- Round 1 always uniform (no difficulty data yet)
+
+### Component 4: Prioritized Buffer Eviction
+
+**File: `scripts/buffer_cleanup.py`**
+
+Current: evicts highest `train_count` files first.
+
+New: evict **low-difficulty + high-train-count** files first (easy, well-trained samples are least valuable).
+
+```python
+# Current eviction sort:
+all_files.sort(key=lambda f: (-f.get("train_count", 0), f["idx"]))
+
+# New eviction sort:
+def eviction_priority(f):
+    tc = f.get("train_count", 0)
+    loss = f.get("avg_loss", float("inf"))  # unknown loss → keep
+    # Low loss + high train_count → evict first (high priority number)
+    # High loss + low train_count → keep (low priority number)
+    return (-loss, tc)  # sort: lowest loss first, then highest tc
+
+all_files.sort(key=eviction_priority)
+```
+
+**Manifest extension**: Add `avg_loss` field to each file entry, updated by training after each epoch.
+
+### Component 5: seq_length Increase to 32K
+
+**Exp18 analysis**: 9.4% of conversations (15.6K) exceed 8K tokens, truncated to opening portion only.
+
+Changes:
+- `--seq-length 32768` in datagen script
+- `--batch-size 1` or `--batch-size 2` (less samples per vLLM call to fit in GPU memory)
+- `--total-seq-len 32768` in training script
+- May need `--gpu-memory-utilization 0.90` for larger KV cache
+
+**Risk**: Training with 32K seq_len needs more GPU memory for attention. FSDP with 8x H200 (144GB each) should handle it, but need to test. Fallback: keep 8192 for datagen, only increase for training via padding.
+
+## Implementation Plan
+
+### Phase 1: Continuous Datagen (core loop)
+
+Modify `scripts/data_generation_offline.py`:
+- Add `--continuous` flag
+- Wrap generation loop in outer `while True`
+- After each round: log stats, re-shuffle dataset
+- File index continues monotonically across rounds
+- Keep manifest status as "generating"
+
+**Estimated changes**: ~50 lines in `data_generation_offline.py`
+
+### Phase 2: Per-Sample Loss Tracking
+
+Modify training pipeline:
+- `eagle3/core.py`: return per-sample loss vector alongside scalar
+- `train/data.py`: pass sample file indices through collate
+- `train/trainer.py`: aggregate per-sample loss to file level, write `difficulty_scores.json`
+
+**Estimated changes**: ~30 lines in `core.py`, ~20 lines in `data.py`, ~50 lines in `trainer.py`
+
+### Phase 3: Difficulty-Weighted Resampling
+
+Modify datagen:
+- Load `difficulty_scores.json` at start of each round
+- Weighted shuffle/sampling of conversation indices
+- Higher loss → higher sampling probability
+
+**Estimated changes**: ~40 lines in `data_generation_offline.py`
+
+### Phase 4: Prioritized Eviction
+
+Modify `buffer_cleanup.py`:
+- Read `avg_loss` from manifest
+- Sort by (low loss, high train_count) for eviction priority
+- Extend manifest write in training to include `avg_loss`
+
+**Estimated changes**: ~20 lines in `buffer_cleanup.py`, ~10 lines in `train_streaming.py`
+
+### Phase 5: seq_length 32K (optional, can be separate experiment)
+
+Modify K8s configs:
+- `--seq-length 32768 --batch-size 1` in datagen
+- `--total-seq-len 32768` in training
+- Test GPU memory on H200 before committing
+
+## Data Flow (Complete)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Datagen Node (.17)                        │
+│                                                             │
+│  Round 1: uniform weights → generate all 165K samples       │
+│  Round 2: load difficulty_scores.json → weighted resample   │
+│  Round 3: updated scores → focus on hard samples            │
+│  ...never exits...                                          │
+│                                                             │
+│  Cleanup thread: evict oldest when >85% budget              │
+│  Output: data_{idx}.pt files (monotonic idx across rounds)  │
+└──────────────────────┬──────────────────────────────────────┘
+                       │ rsync
+┌──────────────────────▼──────────────────────────────────────┐
+│                    Training Node (.18)                       │
+│                                                             │
+│  Streaming training (8 GPU FSDP):                           │
+│  - Each epoch: train on buffer files                        │
+│  - Record per-sample loss → difficulty_scores.json          │
+│  - increment_train_count + update avg_loss in manifest      │
+│                                                             │
+│  Buffer cleanup:                                            │
+│  - Evict low-loss + high-train-count files first            │
+│  - Respect epoch lock                                       │
+│                                                             │
+│  Rsync difficulty_scores.json → datagen node                │
+│  (datagen reads it at start of each round)                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Key Metrics to Track
+
+| Metric | Where | Purpose |
+|--------|-------|---------|
+| Round number | datagen log | Track how many full passes over dataset |
+| Per-file avg_loss | manifest + difficulty_scores.json | Difficulty signal for resampling |
+| Files ever seen | manifest (existing) | Global coverage |
+| Eviction loss distribution | cleanup log | Verify easy samples evicted first |
+| Val acc@0 over time | training log | Convergence quality |
+| Inference Acc@0 | eval (periodic) | True performance metric |
+
+## Expected Outcome
+
+- **No data loss**: Datagen continuously regenerates, evicted samples come back in next round
+- **Curriculum effect**: Hard samples trained more, easy samples less → better generalization
+- **Higher Acc@0**: Training on full diversity of data instead of shrinking pool
+- **Longer sequences**: 32K captures full coding agent conversations (currently 9.4% truncated)
+
+## Dependencies
+
+- Exp18's merged dataset (`/data/datasets/novita_merged_exp18/conversations.jsonl`) — reuse as-is
+- Same Aurora architecture (24 heads, 8192 intermediate)
+- Same nodes (.17 datagen + .18 training)
+
+## Risks
+
+| Risk | Impact | Mitigation |
+|------|--------|-----------|
+| Difficulty scores stale across rounds | Suboptimal resampling | EMA smoothing + periodic refresh |
+| Per-sample loss tracking overhead | Training slowdown | Update every 100 steps, not every step |
+| 32K seq_length OOM | Cannot train | Fallback to 8192; test memory usage first |
+| Difficulty feedback loop diverges | Model ignores easy samples entirely | Min weight floor (50%) ensures coverage |
+| File index overflow across rounds | Disk naming collision | Use `round_{R}_data_{idx}.pt` naming |

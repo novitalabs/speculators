@@ -2,9 +2,9 @@
 set -euo pipefail
 
 ###############################################################################
-# Exp 17: MiniMax-M2.5 Novita0327 Aurora-Arch Training
-# Same Aurora architecture as Exp14/15, trained on weilan55/novita20260327.
-# Data synced from .12 via rsync.
+# Exp 19: Training with continuous datagen + difficulty feedback
+# Same Aurora architecture. Data synced from datagen node via rsync.
+# Writes difficulty_scores.json for datagen to read.
 ###############################################################################
 
 export HF_HUB_OFFLINE=1
@@ -12,7 +12,7 @@ export HF_HOME=/data/hf_cache
 export LOCAL_TRAIN_ENV=1
 
 VERIFIER_NAME_OR_PATH="${MODEL_PATH:-/data/models/MiniMax-M2.5}"
-OUTPUT_PATH="${OUTPUT_PATH:-/data/output/minimax_m2.5_eagle3_novita0327}"
+OUTPUT_PATH="${OUTPUT_PATH:-/data/output/minimax_m2.5_eagle3_exp19}"
 NUM_GPUS="${NUM_GPUS:-8}"
 SEQ_LENGTH="${SEQ_LENGTH:-8192}"
 LR="${LR:-3e-5}"
@@ -22,10 +22,9 @@ POLL_INTERVAL="${POLL_INTERVAL:-30}"
 DATAGEN_NODE="${DATAGEN_NODE:-10.83.115.17}"
 BUFFER_MAX_SIZE_GB="${BUFFER_MAX_SIZE_GB:-500}"
 TARGET_TRAIN_COUNT="${TARGET_TRAIN_COUNT:-10}"
-TARGET_GLOBAL_EPOCHS="${TARGET_GLOBAL_EPOCHS:-10}"
+TARGET_GLOBAL_EPOCHS="${TARGET_GLOBAL_EPOCHS:-0}"
 VAL_EVERY_STEPS="${VAL_EVERY_STEPS:-500}"
 
-# Aurora architecture overrides (same as Exp14)
 OVERRIDE_NUM_ATTENTION_HEADS="${OVERRIDE_NUM_ATTENTION_HEADS:-24}"
 OVERRIDE_INTERMEDIATE_SIZE="${OVERRIDE_INTERMEDIATE_SIZE:-8192}"
 OVERRIDE_ROPE_THETA="${OVERRIDE_ROPE_THETA:-5000000}"
@@ -33,42 +32,28 @@ DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
 
 GEN_DIR="$OUTPUT_PATH/gen"
 MANIFEST_PATH="$GEN_DIR/manifest.json"
-REMOTE_GEN_DIR="/data/output/minimax_m2.5_eagle3_novita0327/gen"
+REMOTE_GEN_DIR="/data/output/minimax_m2.5_eagle3_exp19/gen"
 VOCAB_DIR="$OUTPUT_PATH/vocab_mapping"
 
 echo "============================================="
-echo " Exp 17: MiniMax-M2.5 Novita0327 Aurora-Arch Training"
+echo " Exp 19: Continuous Datagen Training"
 echo " Model:        $VERIFIER_NAME_OR_PATH"
 echo " Data:         $GEN_DIR"
-echo " Manifest:     $MANIFEST_PATH"
 echo " GPUs:         $NUM_GPUS"
-echo " Min Samples:  $MIN_SAMPLES"
-echo " Final Epochs: $FINAL_EPOCHS"
-echo " Datagen Node: $DATAGEN_NODE"
 echo " Buffer Max:   ${BUFFER_MAX_SIZE_GB}GB"
-echo " Target TC:    $TARGET_TRAIN_COUNT"
-echo " Target Epochs:$TARGET_GLOBAL_EPOCHS"
-echo " Val Steps:    $VAL_EVERY_STEPS"
-echo " --- Aurora Architecture Overrides ---"
-echo " Attention Heads: $OVERRIDE_NUM_ATTENTION_HEADS"
-echo " Intermediate:    $OVERRIDE_INTERMEDIATE_SIZE"
-echo " Rope Theta:      $OVERRIDE_ROPE_THETA"
-echo " Draft Vocab:     $DRAFT_VOCAB_SIZE"
+echo " Datagen Node: $DATAGEN_NODE"
 echo "============================================="
 
 mkdir -p "$OUTPUT_PATH"/{checkpoints,logs} "$GEN_DIR" "$VOCAB_DIR"
 
-# Ensure 'python' is available
 if ! command -v python &>/dev/null; then
     ln -s "$(command -v python3)" /usr/local/bin/python
 fi
 
-# Ensure hostname resolves (needed for torchrun with hostNetwork)
 if ! getent hosts "$(hostname)" &>/dev/null; then
     echo "127.0.0.1 $(hostname)" >> /etc/hosts
 fi
 
-# Install rsync and ssh client (not in vllm base image)
 if ! command -v rsync &>/dev/null; then
     echo "[setup] Installing rsync and openssh-client..."
     export http_proxy=http://127.0.0.1:1083 https_proxy=http://127.0.0.1:1083
@@ -79,8 +64,7 @@ fi
 cd /workspace/speculators
 
 ###############################################################################
-# Step 0: Generate vocab mapping (d2t/t2d) if not already present
-# Wait for token_freq.pt from datagen output, fallback to local copy
+# Step 0: Vocab mapping
 ###############################################################################
 D2T_PATH="$VOCAB_DIR/d2t.npy"
 T2D_PATH="$VOCAB_DIR/t2d.npy"
@@ -88,7 +72,6 @@ T2D_PATH="$VOCAB_DIR/t2d.npy"
 if [ ! -f "$D2T_PATH" ] || [ ! -f "$T2D_PATH" ]; then
     TOKEN_FREQ_PATH="$GEN_DIR/token_freq.pt"
 
-    # Try to fetch token_freq.pt from datagen node if not available locally
     if [ ! -f "$TOKEN_FREQ_PATH" ]; then
         echo "[vocab] Waiting for token_freq.pt from datagen node ($DATAGEN_NODE)..."
         for i in $(seq 1 60); do
@@ -103,30 +86,29 @@ if [ ! -f "$D2T_PATH" ] || [ ! -f "$T2D_PATH" ]; then
         done
     fi
 
-    # Fallback to local token_freq.pt (from Exp14, same verifier)
     if [ ! -f "$TOKEN_FREQ_PATH" ]; then
-        echo "[vocab] WARNING: Could not get token_freq.pt from datagen. Using local fallback."
+        echo "[vocab] WARNING: Using local fallback token_freq.pt"
         if [ -f "token_freq.pt" ]; then
             cp token_freq.pt "$TOKEN_FREQ_PATH"
         else
-            echo "[ERROR] No token_freq.pt available (neither remote nor local). Cannot build vocab mapping."
+            echo "[ERROR] No token_freq.pt available."
             exit 1
         fi
     fi
 
-    echo "[vocab] Generating d2t/t2d vocab mapping (draft_vocab=$DRAFT_VOCAB_SIZE)..."
+    echo "[vocab] Generating d2t/t2d vocab mapping..."
     python scripts/build_vocab_mapping.py \
         --token-freq-path "$TOKEN_FREQ_PATH" \
         --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
         --target-vocab-size 200064 \
         --output-path "$VOCAB_DIR"
-    echo "[vocab] Done: d2t=$(python -c "import numpy as np; print(np.load('$D2T_PATH').shape)"), t2d=$(python -c "import numpy as np; print(np.load('$T2D_PATH').shape)")"
 else
     echo "[vocab] Reusing existing vocab mapping at $VOCAB_DIR"
 fi
 
 ###############################################################################
-# Background: rsync from datagen node (.12)
+# Background: rsync from datagen node
+# Also syncs difficulty_scores.json back to datagen node
 ###############################################################################
 echo "[sync] Starting rsync loop from $DATAGEN_NODE..."
 bash scripts/sync_datagen.sh \
@@ -141,13 +123,24 @@ bash scripts/sync_datagen.sh \
 SYNC_PID=$!
 echo "[sync] PID=$SYNC_PID"
 
+# Reverse sync: push difficulty_scores.json to datagen node periodically
+(
+    while true; do
+        sleep 120
+        if [ -f "$GEN_DIR/difficulty_scores.json" ]; then
+            scp -o StrictHostKeyChecking=no -q \
+                "$GEN_DIR/difficulty_scores.json" \
+                "$DATAGEN_NODE:$REMOTE_GEN_DIR/difficulty_scores.json" 2>/dev/null || true
+        fi
+    done
+) &
+DIFFICULTY_SYNC_PID=$!
+echo "[difficulty-sync] PID=$DIFFICULTY_SYNC_PID"
+
 ###############################################################################
-# Background: buffer cleanup (with epoch lock + safety limits)
-# Evicts most-trained files when gen dir exceeds BUFFER_MAX_SIZE_GB.
-# Protected by epoch lock (.epoch_in_progress), max-delete-per-cycle, and
-# min-retain-count to avoid deleting files training is actively reading.
+# Background: buffer cleanup (prioritized eviction by difficulty)
 ###############################################################################
-echo "[cleanup] Starting buffer cleanup (max_delete=5000, min_retain=1000)..."
+echo "[cleanup] Starting buffer cleanup..."
 python scripts/buffer_cleanup.py \
     --manifest-path "$MANIFEST_PATH" \
     --data-dir "$GEN_DIR" \
@@ -160,7 +153,7 @@ CLEANUP_PID=$!
 echo "[cleanup] PID=$CLEANUP_PID"
 
 ###############################################################################
-# Foreground: streaming training with Aurora arch overrides
+# Foreground: streaming training
 ###############################################################################
 TRAIN_LOG="$OUTPUT_PATH/logs/train.log"
 torchrun \
@@ -187,13 +180,12 @@ torchrun \
     --override-num-attention-heads "$OVERRIDE_NUM_ATTENTION_HEADS" \
     --override-intermediate-size "$OVERRIDE_INTERMEDIATE_SIZE" \
     --override-rope-theta "$OVERRIDE_ROPE_THETA" \
-    --run-name "minimax_m2.5_eagle3_novita0327" \
+    --run-name "minimax_m2.5_eagle3_exp19" \
     2>&1 | tee "$TRAIN_LOG"
 
-# Kill background processes
-kill $SYNC_PID ${CLEANUP_PID:+$CLEANUP_PID} 2>/dev/null || true
+kill $SYNC_PID $CLEANUP_PID $DIFFICULTY_SYNC_PID 2>/dev/null || true
 
 echo "============================================="
-echo " Exp 17 novita0327 Aurora-arch training complete!"
+echo " Exp 19 training complete!"
 echo " Checkpoints: $OUTPUT_PATH/checkpoints"
 echo "============================================="

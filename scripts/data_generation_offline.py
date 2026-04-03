@@ -204,6 +204,21 @@ def parse_args():
         default=1,
         help="Total number of datagen shards (default: 1)",
     )
+
+    # Continuous datagen mode
+    parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help="Run datagen in continuous loop mode. Re-shuffles and regenerates "
+             "dataset each round, using difficulty weights from training feedback.",
+    )
+    parser.add_argument(
+        "--difficulty-scores-path",
+        type=str,
+        default=None,
+        help="Path to difficulty_scores.json (written by training). "
+             "Used in --continuous mode for weighted resampling.",
+    )
     return parser.parse_args()
 
 
@@ -238,6 +253,105 @@ def get_dir_size_gb(path: str) -> float:
     return total / (1024**3)
 
 
+def _cleanup_oldest_files(output_dir: str, target_files: int):
+    """Delete oldest data_*.pt files, keeping only the newest target_files."""
+    import re
+
+    entries = []
+    try:
+        for entry in os.scandir(output_dir):
+            m = re.match(r"data_(\d+)\.pt$", entry.name)
+            if m and entry.is_file(follow_symlinks=False):
+                entries.append((int(m.group(1)), entry.path))
+    except OSError:
+        return 0
+
+    if len(entries) <= target_files:
+        return 0
+
+    entries.sort()
+    to_delete = entries[: len(entries) - target_files]
+    deleted = 0
+    for _, path in to_delete:
+        try:
+            os.remove(path)
+            deleted += 1
+        except OSError:
+            pass
+    return deleted
+
+
+def _start_output_cleanup_thread(
+    output_dir: str, max_gb: float, interval: int = 300
+):
+    """Start a daemon thread that evicts oldest files when output dir exceeds max_gb.
+
+    The training node's buffer cleanup only cleans its own local copy — it does NOT
+    delete files on the datagen node. Without datagen-side cleanup, the output
+    directory grows unbounded, hits --max-output-size-gb, and generation stalls.
+
+    Uses size-based eviction: when directory reaches 85% of budget, delete oldest
+    files until directory is at 70% of budget. This avoids relying on estimated
+    file sizes which vary widely across experiments.
+    """
+    import re
+    import threading
+
+    high_watermark = max_gb * 0.85  # start evicting
+    low_watermark = max_gb * 0.70   # stop evicting
+
+    def _evict_to_budget(target_gb: float) -> int:
+        """Delete oldest data_*.pt files until directory is under target_gb."""
+        entries = []
+        try:
+            for entry in os.scandir(output_dir):
+                m = re.match(r"data_(\d+)\.pt$", entry.name)
+                if m and entry.is_file(follow_symlinks=False):
+                    entries.append((int(m.group(1)), entry.path, entry.stat().st_size))
+        except OSError:
+            return 0
+
+        entries.sort()  # oldest first
+        current_gb = sum(s for _, _, s in entries) / (1024**3)
+        if current_gb <= target_gb:
+            return 0
+
+        deleted = 0
+        for _, path, size in entries:
+            if current_gb <= target_gb:
+                break
+            try:
+                os.remove(path)
+                current_gb -= size / (1024**3)
+                deleted += 1
+            except OSError:
+                pass
+        return deleted
+
+    def _loop():
+        while True:
+            time.sleep(interval)
+            size_gb = get_dir_size_gb(output_dir)
+            if size_gb >= high_watermark:
+                deleted = _evict_to_budget(low_watermark)
+                if deleted > 0:
+                    new_size = get_dir_size_gb(output_dir)
+                    log.info(
+                        f"[cleanup] Evicted {deleted} old files "
+                        f"({size_gb:.0f}GB -> {new_size:.0f}GB, "
+                        f"budget={max_gb:.0f}GB)"
+                    )
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    log.info(
+        f"[cleanup] Background cleanup started "
+        f"(high={high_watermark:.0f}GB, low={low_watermark:.0f}GB, "
+        f"interval={interval}s)"
+    )
+    return t
+
+
 def wait_for_output_budget(output_dir: str, max_gb: float, poll_interval: int = 60):
     """Block until output directory is under the size limit."""
     while True:
@@ -249,6 +363,74 @@ def wait_for_output_budget(output_dir: str, max_gb: float, poll_interval: int = 
             f"waiting {poll_interval}s for space to free up..."
         )
         time.sleep(poll_interval)
+
+
+def load_difficulty_weights(
+    scores_path: str | None, num_samples: int
+) -> list[float] | None:
+    """Load per-sample difficulty weights from training feedback.
+
+    Returns None for uniform sampling (round 1 or no scores file).
+    Higher loss → higher weight → more likely to be regenerated.
+    """
+    if scores_path is None or not os.path.exists(scores_path):
+        return None
+
+    try:
+        with open(scores_path) as f:
+            scores = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    if not scores:
+        return None
+
+    # Map file-level scores to sample indices
+    weights = []
+    values = list(scores.values())
+    min_loss = min(values)
+    max_loss = max(values)
+    loss_range = max_loss - min_loss if max_loss > min_loss else 1.0
+
+    for i in range(num_samples):
+        key = f"data_{i}.pt"
+        if key in scores:
+            normalized = (scores[key] - min_loss) / loss_range
+            # Min 50% weight for easy samples, max 150% for hard
+            weights.append(0.5 + normalized)
+        else:
+            weights.append(1.0)  # unseen → default
+
+    log.info(
+        f"[difficulty] Loaded {len(scores)} scores, "
+        f"loss range [{min_loss:.3f}, {max_loss:.3f}]"
+    )
+    return weights
+
+
+def weighted_sample_order(
+    num_samples: int, weights: list[float] | None, seed: int
+) -> list[int]:
+    """Return sample indices shuffled by weighted probability.
+
+    If weights is None, returns a simple shuffle (uniform).
+    Uses Gumbel-max trick for weighted shuffle without replacement.
+    """
+    import numpy as _np
+
+    rng = _np.random.default_rng(seed)
+    indices = _np.arange(num_samples)
+
+    if weights is None:
+        rng.shuffle(indices)
+        return indices.tolist()
+
+    # Gumbel-max trick: add Gumbel noise scaled by log(weight), sort descending
+    w = _np.array(weights, dtype=_np.float64)
+    w = _np.maximum(w, 1e-6)
+    keys = _np.log(w) + rng.gumbel(size=num_samples)
+    order = _np.argsort(-keys)
+    return order.tolist()
 
 
 def save_sample_to_disk(data_dict, output_path):
@@ -280,11 +462,25 @@ def save_config(args, generator, num_samples, output_dir):
     log.info(f"Saved config v{config.version} to {config_path}")
 
 
-def generate_and_save_hidden_states(args, dataset):
-    """Generate hidden states and save each sample as a .pt file"""
+def generate_and_save_hidden_states(
+    args, dataset, *, file_idx_start: int | None = None, generator=None
+):
+    """Generate hidden states and save each sample as a .pt file.
+
+    Args:
+        file_idx_start: Override starting file index (for continuous mode).
+            If None, auto-detect from existing files.
+        generator: Reuse existing VllmHiddenStatesGenerator (for continuous mode).
+
+    Returns:
+        (num_saved, final_file_idx, generator) tuple.
+    """
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    start_file_idx = find_last_checkpoint(args.output_dir)
+    if file_idx_start is not None:
+        start_file_idx = file_idx_start
+    else:
+        start_file_idx = find_last_checkpoint(args.output_dir)
 
     # Load existing sample lengths to preserve them on resume
     sample_lengths_output_path = Path(args.output_dir) / "sample_lengths.json"
@@ -303,18 +499,23 @@ def generate_and_save_hidden_states(args, dataset):
     num_samples = len(dataset)
     start_sample_idx = start_file_idx - args.start_idx
 
-    if start_sample_idx >= num_samples:
+    if file_idx_start is None and start_sample_idx >= num_samples:
         log.info("All samples already processed!")
-        return 0
+        return 0, start_file_idx, generator
 
-    log.subsection("Initializing vLLM hidden states generator")
-    generator = VllmHiddenStatesGenerator(
-        model_path=args.target_model_path,
-        layer_ids=args.layer_ids,
-        max_model_len=args.seq_length,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        tensor_parallel_size=args.tensor_parallel_size,
-    )
+    # In continuous mode, always process from sample 0 (dataset is re-ordered)
+    if file_idx_start is not None:
+        start_sample_idx = 0
+
+    if generator is None:
+        log.subsection("Initializing vLLM hidden states generator")
+        generator = VllmHiddenStatesGenerator(
+            model_path=args.target_model_path,
+            layer_ids=args.layer_ids,
+            max_model_len=args.seq_length,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            tensor_parallel_size=args.tensor_parallel_size,
+        )
 
     log.info(f"Processing {num_samples - start_sample_idx}/{num_samples} samples")
     file_idx = start_file_idx
@@ -322,6 +523,10 @@ def generate_and_save_hidden_states(args, dataset):
     num_batches = (
         num_samples - start_sample_idx + args.batch_size - 1
     ) // args.batch_size
+
+    # Start background cleanup thread to evict old files before disk fills up
+    if args.max_output_size_gb > 0:
+        _start_output_cleanup_thread(args.output_dir, args.max_output_size_gb)
 
     # Use ThreadPoolExecutor for async file I/O
     max_io_workers = MAX_IO_WORKERS
@@ -388,7 +593,7 @@ def generate_and_save_hidden_states(args, dataset):
 
     save_config(args, generator, num_samples, args.output_dir)
 
-    return samples_saved
+    return samples_saved, file_idx, generator
 
 
 def main():
@@ -429,14 +634,45 @@ def main():
             f"samples {start}-{end} ({len(dataset)} total)"
         )
 
-    num_saved = generate_and_save_hidden_states(args, dataset)
+    if args.continuous:
+        # Continuous mode: loop over dataset with difficulty-weighted resampling
+        datagen_round = 0
+        file_idx = find_last_checkpoint(args.output_dir)
+        generator = None
 
-    # Mark manifest as complete
-    if args.manifest_path:
-        manifest_mod.mark_complete(args.manifest_path)
+        while True:
+            datagen_round += 1
+            log.section(f"Continuous datagen: Round {datagen_round}")
 
-    log.section("Data generation complete!")
-    log.info(f"Saved {num_saved} files to {args.output_dir}")
+            weights = load_difficulty_weights(
+                args.difficulty_scores_path, len(dataset)
+            )
+            if weights is not None:
+                log.info(f"Using difficulty-weighted sampling (round {datagen_round})")
+            else:
+                log.info(f"Using uniform sampling (round {datagen_round})")
+
+            sample_order = weighted_sample_order(
+                len(dataset), weights, seed=args.seed + datagen_round
+            )
+            reordered = dataset.select(sample_order)
+
+            num_saved, file_idx, generator = generate_and_save_hidden_states(
+                args, reordered, file_idx_start=file_idx, generator=generator
+            )
+            log.info(
+                f"Round {datagen_round} complete: {num_saved} files saved, "
+                f"next file_idx={file_idx}"
+            )
+    else:
+        # Single-pass mode (original behavior)
+        num_saved, _, _ = generate_and_save_hidden_states(args, dataset)
+
+        if args.manifest_path:
+            manifest_mod.mark_complete(args.manifest_path)
+
+        log.section("Data generation complete!")
+        log.info(f"Saved {num_saved} files to {args.output_dir}")
 
 
 if __name__ == "__main__":
