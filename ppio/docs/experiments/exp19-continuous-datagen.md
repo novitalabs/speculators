@@ -1,6 +1,6 @@
 # Experiment 19: Continuous Datagen with Difficulty-Weighted Resampling
 
-## Status: RUNNING (deployed 2026-04-03, datagen round 1 in progress)
+## Status: RUNNING (deployed 2026-04-03, training epoch 6+, ckpt5 eval complete)
 
 ## Motivation
 
@@ -279,3 +279,42 @@ Modify K8s configs:
 | 32K seq_length OOM | Cannot train | Fallback to 8192; test memory usage first |
 | Difficulty feedback loop diverges | Model ignores easy samples entirely | Min weight floor (50%) ensures coverage |
 | File index overflow across rounds | Disk naming collision | Use `round_{R}_data_{idx}.pt` naming |
+
+## Eval Results
+
+### 2026-04-03 — ckpt5 (Epoch 6) Simple Eval
+
+Novita (10 prompts) + ZClawBench (116 short prompts), `max_model_len=8192`:
+
+| Benchmark | Baseline tok/s | Spec tok/s | Speedup | Acc@0 | Acc@1 | Acc@2 | AccLen |
+|-----------|---------------|------------|---------|-------|-------|-------|--------|
+| Novita | 561.4 | 682.5 | **1.22x** | 49.3% | 23.3% | 10.3% | 1.829 |
+| ZClawBench | 3613.9 | 3703.3 | **1.02x** | 33.8% | 10.8% | 3.8% | 1.485 |
+
+Training metrics at time of eval: `full_acc_0 ≈ 55-60%`, `loss ≈ 3.2-6.3`, epoch 6.
+
+### 2026-04-03 — ckpt5 (Epoch 6) Full ZClawBench Eval
+
+650 multi-turn agent trajectories from [zai-org/ZClawBench](https://huggingface.co/datasets/zai-org/ZClawBench), `max_model_len=32768`, bucketed by input length:
+
+| Bucket | #Prompts | Avg Input Tokens | Baseline tok/s | Spec tok/s | Speedup | Acc@0 | AccLen |
+|--------|----------|-----------------|---------------|------------|---------|-------|--------|
+| short (0-2K) | 210 | 847 | 5267.6 | 3183.3 | **0.60x** | 32.3% | 1.455 |
+| med (2K-8K) | 320 | 4601 | 2312.9 | 2187.2 | **0.95x** | 30.8% | 1.440 |
+| long (8K-32K) | 119 | 12177 | 903.0 | 915.8 | **1.01x** | 31.7% | 1.429 |
+
+**Observations:**
+- Acc@0 ~31-32% across all buckets — far below the ~55%+ threshold needed for speedup
+- Short prompts **slow down 40%** due to spec decode overhead exceeding acceptance benefit at high batch concurrency
+- Medium prompts nearly break even (0.95x), still net negative
+- Long prompts barely break even (1.01x) — decode-bound regime where spec decode has more room but Acc@0 too low
+- Novita eval shows higher Acc@0 (49.3%) because Novita data is closer to training distribution (novita_merged_exp18)
+- ZClawBench is harder: diverse agent tasks (6 categories), long tool-use trajectories, different from training data
+
+**Conclusion:** ckpt5 is too early (epoch 6). Draft model accuracy insufficient for speedup. Continue training; re-eval at higher epoch when `full_acc_0` stabilizes above 60%.
+
+**Eval infrastructure:**
+- Created `speculators-eval` submodule with organized eval scripts, K8s configs, tools, and data
+- Added `eval/scripts/run_minimax_m2.5_eval_exp19.sh` (simple eval)
+- Added `eval/scripts/run_minimax_m2.5_eval_exp19_zclawbench_full.sh` (full 650-prompt bucketed eval)
+- Downloaded full ZClawBench dataset (696 trajectories → 650 valid) to `/data/datasets/zclawbench/zclawbench_full_696.json`

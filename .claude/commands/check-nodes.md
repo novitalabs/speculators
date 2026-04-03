@@ -8,7 +8,7 @@ bash ppio/scripts/check_nodes.sh
 
 ## What to check
 
-All available nodes: 10.83.115.{10,12,17,18,21,22,23,25,26,27,28}
+All available nodes: 10.83.115.{10,12,14,17,18,21,22,23,25,26,27,28}
 
 For each node, report:
 1. **GPU allocation**: allocated/total GPUs

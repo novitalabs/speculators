@@ -1,4 +1,6 @@
 import bisect
+import glob
+import os
 import random
 import re
 from re import Pattern
@@ -6,7 +8,7 @@ from typing import Any, cast
 
 import torch
 from datasets import Dataset as HFDataset
-from datasets import load_dataset
+from datasets import concatenate_datasets, load_dataset
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from speculators.data_generation.configs import DATASET_CONFIGS
@@ -393,19 +395,65 @@ def build_eagle3_dataset(
     return dataset
 
 
+def _normalize_column_names(ds: HFDataset) -> HFDataset:
+    """Rename 'messages' to 'conversations' if needed."""
+    if "messages" in ds.column_names and "conversations" not in ds.column_names:
+        ds = ds.rename_column("messages", "conversations")
+    return ds
+
+
 def load_raw_dataset(
     train_data_path: str, num_proc: int = 8, cache_dir: str | None = None
 ) -> HFDataset:
-    """Load raw dataset from local file or HuggingFace."""
+    """Load raw dataset from local file, directory, or HuggingFace."""
     if train_data_path.endswith((".jsonl", ".json")):
-        return load_dataset(
-            "json", data_files=train_data_path, split="train", cache_dir=cache_dir
+        return _normalize_column_names(
+            load_dataset(
+                "json", data_files=train_data_path, split="train", cache_dir=cache_dir
+            )
         )
+
+    if train_data_path.endswith(".parquet"):
+        return _normalize_column_names(
+            load_dataset(
+                "parquet", data_files=train_data_path, split="train", cache_dir=cache_dir
+            )
+        )
+
+    if os.path.isdir(train_data_path):
+        parquet_files = sorted(glob.glob(os.path.join(train_data_path, "*.parquet")))
+        jsonl_files = sorted(glob.glob(os.path.join(train_data_path, "*.jsonl")))
+        if parquet_files:
+            log.info(f"Loading {len(parquet_files)} parquet files from {train_data_path}")
+            # Load each file individually to handle schema mismatches,
+            # then keep only the conversations/messages column
+            datasets = []
+            for pf in parquet_files:
+                ds = load_dataset(
+                    "parquet", data_files=pf, split="train", cache_dir=cache_dir
+                )
+                ds = _normalize_column_names(ds)
+                # Keep only the conversations column
+                ds = ds.select_columns(["conversations"])
+                datasets.append(ds)
+                log.info(f"  {os.path.basename(pf)}: {len(ds)} samples")
+            combined = concatenate_datasets(datasets)
+            log.info(f"Total: {len(combined)} samples from {len(parquet_files)} files")
+            return combined
+        if jsonl_files:
+            log.info(f"Loading {len(jsonl_files)} JSONL files from {train_data_path}")
+            return _normalize_column_names(
+                load_dataset(
+                    "json", data_files=jsonl_files, split="train", cache_dir=cache_dir
+                )
+            )
+        raise ValueError(f"No .parquet or .jsonl files found in {train_data_path}")
 
     if train_data_path not in DATASET_CONFIGS:
         raise ValueError(
             f"Unsupported dataset: {train_data_path}. "
-            f"Supported: local .json/.jsonl files or {list(DATASET_CONFIGS.keys())}"
+            f"Supported: local .json/.jsonl/.parquet files, directories, "
+            f"or {list(DATASET_CONFIGS.keys())}"
         )
 
     config = DATASET_CONFIGS[train_data_path]

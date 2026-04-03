@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-NODES="${@:-10 12 17 18 21 22 23 25 26 27 28}"
+NODES="${@:-10 12 14 17 18 21 22 23 25 26 27 28}"
 PREFIX="10.83.115"
 
 # Production namespaces that must NOT be killed

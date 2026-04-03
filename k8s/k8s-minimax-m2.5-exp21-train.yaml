@@ -1,35 +1,38 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: minimax-m2-5-eval-exp16-5
+  name: minimax-m2-5-exp21-train
   labels:
     app: speculators
-    task: eagle3-eval-exp16.5
+    task: exp21-train
+    model: minimax-m2.5
 spec:
   restartPolicy: Never
-  nodeName: "host-10-83-115-18"
+  nodeName: "host-10-83-115-23"
   hostNetwork: true
   dnsPolicy: ClusterFirstWithHostNet
 
   containers:
-    - name: eagle3-eval
+    - name: streaming-train
       image: speculators:v0.17.0
       imagePullPolicy: IfNotPresent
-      command: ["bash", "/workspace/speculators/k8s/run_minimax_m2.5_eval_exp16.5.sh"]
+      command: ["bash", "/workspace/speculators/k8s/run_minimax_m2.5_exp21_train.sh"]
 
       env:
+        - name: MODEL_PATH
+          value: "/data/models/MiniMax-M2.5"
         - name: HF_HUB_OFFLINE
           value: "1"
         - name: HF_HOME
           value: "/data/hf_cache"
+        - name: NUM_GPUS
+          value: "8"
         - name: NCCL_DEBUG
           value: "WARN"
-        - name: VLLM_USE_V1
-          value: "1"
-        - name: PYTHONDONTWRITEBYTECODE
-          value: "1"
         - name: LD_LIBRARY_PATH
           value: "/lib/x86_64-linux-gnu:/usr/local/nvidia/lib64:/usr/local/cuda/lib64"
+        - name: DATAGEN_NODE
+          value: "10.83.115.14"
 
       resources:
         limits:
@@ -46,6 +49,9 @@ spec:
           mountPath: /workspace/speculators
         - name: shm
           mountPath: /dev/shm
+        - name: ssh-keys
+          mountPath: /root/.ssh
+          readOnly: true
 
   volumes:
     - name: data-volume
@@ -60,3 +66,7 @@ spec:
       emptyDir:
         medium: Memory
         sizeLimit: "256Gi"
+    - name: ssh-keys
+      hostPath:
+        path: /root/.ssh
+        type: Directory
