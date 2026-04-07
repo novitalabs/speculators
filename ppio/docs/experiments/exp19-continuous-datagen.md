@@ -1,6 +1,6 @@
 # Experiment 19: Continuous Datagen with Difficulty-Weighted Resampling
 
-## Status: RUNNING (deployed 2026-04-03, training epoch 6+, ckpt5 eval complete)
+## Status: COMPLETE (80 epochs trained, epoch 79 eval done)
 
 ## Motivation
 
@@ -318,3 +318,91 @@ Training metrics at time of eval: `full_acc_0 ≈ 55-60%`, `loss ≈ 3.2-6.3`, e
 - Added `eval/scripts/run_minimax_m2.5_eval_exp19.sh` (simple eval)
 - Added `eval/scripts/run_minimax_m2.5_eval_exp19_zclawbench_full.sh` (full 650-prompt bucketed eval)
 - Downloaded full ZClawBench dataset (696 trajectories → 650 valid) to `/data/datasets/zclawbench/zclawbench_full_696.json`
+
+### 2026-04-04 — Training Progress (Epoch 28) + NCCL Crash
+
+**Training metrics at epoch 28 (last step before crash):**
+- `full_acc_0 = 78.0%` (up from ~55-60% at ckpt5/epoch 6)
+- `loss = 1.187` (down from ~3.2-6.3 at ckpt5)
+- Checkpoints saved: epoch 24, 25, 26, 27 (all overwritten into `checkpoints/5/`)
+
+### Issue: NCCL Timeout Crash at Epoch 28 Validation
+
+**When**: 2026-04-03 21:49 UTC, immediately after epoch 28 training completed, during validation/checkpoint save phase
+**Symptom**: All 8 ranks hit NCCL `_ALLGATHER_BASE` timeout (30 min / 1800s). Root cause rank 5 received SIGABRT first, then ranks 0-4,6,7 followed. Pod status: `Error`.
+**Root cause**: NCCL collective operation hung during FSDP all-gather in validation phase. Likely transient GPU communication issue or memory pressure during checkpoint save. SeqNum=276118 on most ranks.
+**Fix**: Delete failed pod and recreate — training script auto-resumes from last saved checkpoint (epoch 27). Datagen pod on .17 still running (39.5%, 16374/41443 samples).
+**Data preserved**: Last checkpoint is epoch 27 in `checkpoints/5/`. Epoch 28 training completed but checkpoint was NOT saved.
+
+### 2026-04-06 — Training Progress (Epoch 73) + 2nd NCCL Crash
+
+**Training metrics at epoch 73 (last steps before crash):**
+- `full_acc_0 ≈ 45-78%` (high batch-level variance), `loss ≈ 0.2-0.35`
+- Trained from epoch 28 to 73 after first restart (45 epochs in ~33 hours)
+- Checkpoints saved: epoch 43-72 (all overwritten into `checkpoints/5/`)
+- Loss dropped significantly: 1.2 → 0.3, but full_acc_0 plateau around 70-80% with high variance
+
+### Issue 2: NCCL Timeout Crash at Epoch 73 Validation
+
+**When**: 2026-04-05 13:08 UTC, after epoch 73 training completed, during validation/checkpoint save
+**Symptom**: Same pattern as Issue 1 — NCCL `_ALLGATHER_BASE` timeout across all 8 ranks. Root cause rank 2 SIGABRT first.
+**Root cause**: Recurring NCCL timeout during FSDP all-gather in validation. This is the 2nd occurrence — likely a systematic issue with .18 node GPU interconnect or memory pressure during checkpoint save.
+**Fix**: Delete and recreate pod — resumes from epoch 72 checkpoint.
+**Data preserved**: Last checkpoint is epoch 72 in `checkpoints/5/`.
+
+### 2026-04-07 — Training Progress (Epoch 80) + 3rd NCCL Crash
+
+**Training metrics at epoch 80 (last steps before crash):**
+- `full_acc_0 ≈ 43-86%` (still high variance), `loss ≈ 0.2-0.6`
+- Trained from epoch 73 to 80 after 2nd restart (7 epochs in ~5 hours)
+- Checkpoints saved: epoch 73-79 (overwritten into `checkpoints/5/`)
+- **No significant improvement since epoch ~50** — model appears converged
+
+### Issue 3: NCCL Timeout Crash at Epoch 80 Validation
+
+**When**: 2026-04-06 11:31 UTC, after epoch 80 training completed, during validation/checkpoint save
+**Symptom**: Same NCCL timeout pattern. Root cause rank 0.
+**Root cause**: 3rd occurrence of identical failure. This is a **systematic issue** with .18 node — NCCL hangs during FSDP all-gather in validation/checkpoint save phase every ~20-45 epochs.
+**Fix**: Delete and recreate pod — resumes from epoch 79 checkpoint.
+**Data preserved**: Last checkpoint is epoch 79 in `checkpoints/5/`.
+
+**Note on convergence**: Training metrics have plateaued since ~epoch 50. full_acc_0 oscillates 43-86% (batch-level), loss ~0.2-0.5. Should run eval on current checkpoint (epoch 79) to assess actual inference speedup before continuing.
+
+### 2026-04-07 — Epoch 79 Final Eval
+
+Stopped training after 80 epochs (3 NCCL crashes, model converged). Evaluated epoch 79 checkpoint.
+
+#### Simple Eval (Novita 10 prompts + ZClawBench 116 prompts, `max_model_len=8192`)
+
+| Benchmark | Baseline tok/s | Spec tok/s | Speedup | Acc@0 | Acc@1 | Acc@2 | AccLen |
+|-----------|---------------|------------|---------|-------|-------|-------|--------|
+| Novita | 521.6 | 798.9 | **1.53x** | 65.8% | 35.2% | 18.5% | 2.196 |
+| ZClawBench | 3612.3 | 4015.0 | **1.11x** | 43.1% | 16.2% | 6.4% | 1.657 |
+
+#### Full ZClawBench Eval (650 prompts, `max_model_len=32768`, bucketed by input length)
+
+| Bucket | #Prompts | Avg Input | Baseline tok/s | Spec tok/s | Speedup | Acc@0 | AccLen |
+|--------|----------|-----------|---------------|------------|---------|-------|--------|
+| short (0-2K) | 210 | 847 | 5296.7 | 3616.8 | **0.68x** | 43.8% | 1.649 |
+| med (2K-8K) | 320 | 4601 | 2328.9 | 2415.0 | **1.04x** | 47.4% | 1.712 |
+| long (8K-32K) | 119 | 12177 | 907.3 | 985.0 | **1.09x** | 47.6% | 1.702 |
+
+#### Comparison: ckpt5 (Epoch 6) vs ckpt79 (Epoch 79)
+
+| Metric | ckpt5 (Epoch 6) | ckpt79 (Epoch 79) | Delta |
+|--------|----------------|-------------------|-------|
+| Novita Acc@0 | 49.3% | 65.8% | +16.5pp |
+| Novita Speedup | 1.22x | 1.53x | +0.31x |
+| ZClawBench Acc@0 | 33.8% | 43.1% | +9.3pp |
+| ZClawBench Speedup | 1.02x | 1.11x | +0.09x |
+| Full ZClaw short | 0.60x | 0.68x | +0.08x |
+| Full ZClaw med | 0.95x | 1.04x | +0.09x |
+| Full ZClaw long | 1.01x | 1.09x | +0.08x |
+
+#### Analysis
+
+- **Novita (in-distribution)**: Strong improvement — 1.53x speedup with 65.8% Acc@0. Demonstrates the model learns well on training-distribution data.
+- **ZClawBench (out-of-distribution)**: Moderate improvement — Acc@0 rose from 33.8% to 43.1%, but still insufficient for meaningful speedup in high-concurrency short-prompt scenarios (0.68x slowdown).
+- **Length dependence**: Short prompts slow down (spec decode overhead > acceptance benefit at high batch throughput). Med/long prompts just barely break even (1.04-1.09x).
+- **Bottleneck**: OOD generalization. Training data (Novita conversations) differs significantly from eval data (ZClawBench agent tasks with tool_use/tool_result/thinking blocks). Acc@0 needs >55% across all buckets for consistent speedup.
+- **Training saturation**: 80 epochs with no improvement since ~epoch 50. More training on the same data will not help. Next steps should focus on expanding training data diversity (e.g., agent task trajectories, tool-use conversations) or architecture changes.

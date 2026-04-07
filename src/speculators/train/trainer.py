@@ -259,9 +259,9 @@ class Trainer:
                 self.model.train()  # restore train mode
 
     @torch.no_grad()
-    def val_epoch(self, epoch: int):
+    def val_epoch(self, epoch: int) -> dict[str, float]:
         if self.val_loader is None:
-            return
+            return {}
         self.model.eval()
         if hasattr(self.val_loader.batch_sampler, "set_epoch"):
             self.val_loader.batch_sampler.set_epoch(epoch)  # type: ignore[union-attr]
@@ -294,6 +294,7 @@ class Trainer:
         metric_logger.info(
             {"val": val_metrics, "epoch": epoch}, extra={"step": self.global_step}
         )
+        return val_metrics
 
     def save_checkpoint(self, epoch: int):
         self.checkpointer.save_checkpoint(self.model, self.opt, epoch)

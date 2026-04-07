@@ -16,6 +16,7 @@ Usage:
 import argparse
 import logging
 import os
+import shutil
 from pathlib import Path
 import random
 import time
@@ -319,6 +320,9 @@ def main(args: argparse.Namespace):
     files_ever_seen: set[str] = set()
     global_epoch_count = 0
 
+    # Track val loss per epoch for checkpoint pruning (best-N by val loss)
+    ckpt_val_scores: dict[int, float] = {}
+
     while True:
         root_logger.info(
             f"Epoch {epoch}: {len(train_files)} train files, "
@@ -333,12 +337,39 @@ def main(args: argparse.Namespace):
         torch.cuda.empty_cache()
         root_logger.info(f"Epoch {epoch}: training complete, starting validation...")
 
+        val_metrics = {}
         if val_loader is not None:
-            trainer.val_epoch(epoch)
+            val_metrics = trainer.val_epoch(epoch)
 
         root_logger.info(f"Epoch {epoch}: validation complete, saving checkpoint...")
 
         trainer.save_checkpoint(epoch)
+
+        # Track val loss for checkpoint pruning
+        val_loss = val_metrics.get("loss_epoch", float("inf"))
+        ckpt_val_scores[epoch] = val_loss
+
+        # Prune checkpoints — keep only the best N by validation loss
+        ckpt_dir = Path(args.save_path)
+        if ckpt_dir.exists() and args.keep_checkpoints > 0:
+            # Find existing checkpoint dirs that we have scores for
+            existing = [
+                int(d.name) for d in ckpt_dir.iterdir()
+                if d.is_dir() and d.name.isdigit()
+            ]
+            scored = {e: ckpt_val_scores[e] for e in existing if e in ckpt_val_scores}
+            unscored = [e for e in existing if e not in ckpt_val_scores]
+            # Sort scored checkpoints by val loss (best = lowest)
+            best_scored = sorted(scored, key=lambda e: scored[e])
+            # Keep best N scored + all unscored (no val data to judge)
+            keep = set(best_scored[:args.keep_checkpoints]) | set(unscored)
+            for e in existing:
+                if e not in keep:
+                    old_path = ckpt_dir / str(e)
+                    shutil.rmtree(old_path, ignore_errors=True)
+                    root_logger.info(
+                        f"Pruned checkpoint {e} (val_loss={scored.get(e, '?')})"
+                    )
 
         root_logger.info(f"Epoch {epoch}: checkpoint saved.")
 
@@ -551,6 +582,10 @@ def parse_args():
     parser.add_argument(
         "--target-global-epochs", type=int, default=10,
         help="Terminate when this many global epochs are reached (0 = use --final-epochs fallback)",
+    )
+    parser.add_argument(
+        "--keep-checkpoints", type=int, default=5,
+        help="Keep the N checkpoints with the best validation loss (default: 5)",
     )
 
     return parser.parse_args()

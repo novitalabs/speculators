@@ -57,9 +57,23 @@ def cleanup_once(
         max_delete: Max files to delete per cycle (0 = unlimited).
         min_retain: Always keep at least this many files in manifest (0 = no minimum).
     """
-    # Check epoch lock — skip cleanup while training is actively using files
+    # Check epoch lock — skip cleanup while training is actively using files,
+    # UNLESS we've exceeded the hard limit (1.5x max_size) to prevent disk-full.
     lock_file = os.path.join(data_dir, ".epoch_in_progress")
-    if os.path.exists(lock_file):
+    force_cleanup = False
+    if os.path.exists(lock_file) and max_size_bytes is not None:
+        current_size = _dir_size_bytes(data_dir)
+        hard_limit = int(max_size_bytes * 1.5)
+        if current_size > hard_limit:
+            log.warning(
+                f"Epoch in progress but buffer {current_size / 1e9:.1f}GB exceeds "
+                f"hard limit {hard_limit / 1e9:.1f}GB — forcing cleanup"
+            )
+            force_cleanup = True
+        else:
+            log.info("Epoch in progress, skipping cleanup")
+            return 0
+    elif os.path.exists(lock_file):
         log.info("Epoch in progress, skipping cleanup")
         return 0
 
@@ -101,7 +115,8 @@ def cleanup_once(
         if min_retain > 0 and remaining <= min_retain:
             break
         # Re-check epoch lock — a new epoch may have started during eviction
-        if os.path.exists(lock_file):
+        # (skip this check if we're force-cleaning due to hard limit breach)
+        if not force_cleanup and os.path.exists(lock_file):
             log.info("Epoch started during eviction, stopping early")
             break
 
