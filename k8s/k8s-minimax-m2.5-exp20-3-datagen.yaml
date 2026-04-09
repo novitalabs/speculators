@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: minimax-m2-5-exp20-3-datagen
+  labels:
+    app: speculators
+    task: exp20-3-datagen
+    model: minimax-m2.5
+spec:
+  restartPolicy: Never
+  nodeName: "host-10-83-115-17"
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+
+  containers:
+    - name: datagen
+      image: speculators:v0.17.0
+      imagePullPolicy: IfNotPresent
+      command: ["bash", "/workspace/speculators/k8s/run_minimax_m2.5_exp20_3_datagen.sh"]
+
+      env:
+        - name: MODEL_PATH
+          value: "/data/models/MiniMax-M2.5"
+        - name: VLLM_ATTENTION_BACKEND
+          value: "FLASH_ATTN"
+        - name: LD_LIBRARY_PATH
+          value: "/lib/x86_64-linux-gnu:/usr/local/nvidia/lib64:/usr/local/cuda/lib64"
+
+      resources:
+        limits:
+          nvidia.com/gpu: "8"
+        requests:
+          nvidia.com/gpu: "8"
+          memory: "256Gi"
+          cpu: "64"
+
+      volumeMounts:
+        - name: data-volume
+          mountPath: /data
+        - name: speculators-code
+          mountPath: /workspace/speculators
+        - name: shm
+          mountPath: /dev/shm
+
+  volumes:
+    - name: data-volume
+      hostPath:
+        path: /data
+        type: Directory
+    - name: speculators-code
+      hostPath:
+        path: /data/tengwan/develop/speculators
+        type: Directory
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: "256Gi"

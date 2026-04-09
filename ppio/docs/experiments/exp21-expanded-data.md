@@ -115,17 +115,45 @@ kubectl apply -f k8s/k8s-minimax-m2.5-exp21-train.yaml
   - Difficulty-weighted resampling never activated (still in round 1)
 - Compared to exp19 (val_acc@0 ~0.55-0.60 at ckpt5), exp21 consistently better → larger dataset helps
 - val_loss improved over time (4.2 → 3.7) even as acc@0 plateaued, indicating better calibration on later tokens
-### Eval Results (ckpt 62, node .23)
+### Eval 1: novita20260312_eval + ZClawBench (ckpt 62, node .23)
+
+Eval data: `novita20260312_eval/conversations.jsonl` (50 sampled prompts) + ZClawBench (116 prompts), node .23, TP=4, max_model_len=8192.
 
 | Config | Benchmark | #Prompts | Tokens/s | Speedup | Acc@0 | Acc@1 | Acc@2 | Acc Len |
 |--------|-----------|----------|----------|---------|-------|-------|-------|---------|
-| Baseline (no spec) | Novita | 50 | 426.0 | 1.00x | — | — | — | — |
-| **exp21 ckpt62** | **Novita** | **50** | **536.2** | **1.26x** | **0.589** | **0.345** | **0.182** | **2.12** |
+| Baseline (no spec) | Novita (0312_eval) | 50 | 426.0 | 1.00x | — | — | — | — |
+| **exp21 ckpt62** | **Novita (0312_eval)** | **50** | **536.2** | **1.26x** | **0.589** | **0.345** | **0.182** | **2.12** |
 | Baseline (no spec) | ZClawBench | 116 | 2,759.0 | 1.00x | — | — | — | — |
 | **exp21 ckpt62** | **ZClawBench** | **116** | **1,133.5** | **0.41x** | **0.427** | **0.169** | **0.071** | **1.67** |
 
 **Observations:**
-- **Novita**: 1.26x speedup with Acc@0=0.589, acceptance length=2.12. Positive but modest gain
+- **Novita (0312_eval)**: 1.26x speedup with Acc@0=0.589, acceptance length=2.12. Positive but modest gain
 - **ZClawBench**: 0.41x — spec decode is **slower** than baseline. Baseline batched throughput (2759 tok/s) is very high; draft overhead exceeds savings at high batch sizes. Acc@0=0.427 also indicates poor draft prediction on multi-turn agent trajectories
-- Compared to exp19 (ckpt5): Novita Acc@0 comparable (~0.59 vs ~0.55-0.60), 4.4x more data did **not** significantly improve acceptance rate
 - The benefit of spec decode is batch-size dependent — online serving (batch=1) would show larger speedups than this batched eval
+
+### Eval 2: Controlled Comparison — Exp19 vs Exp21 (node .14, novita_merged eval)
+
+To eliminate confounding factors, ran both checkpoints on the same node (.14), same eval data (novita_merged/eval.jsonl, 100 prompts, seed=42), same parameters (TP=4, max_model_len=8192):
+
+| Config | Tok/s | Speedup | Acc@0 | Acc@1 | Acc@2 | AccLen |
+|--------|-------|---------|-------|-------|-------|--------|
+| Baseline (no spec) | 2,700.7 | 1.00x | — | — | — | — |
+| **Exp19 ckpt79** | 3,667.2 | **1.36x** | 60.3% | 34.9% | 17.8% | 2.129 |
+| **Exp21 ckpt62** | 4,237.1 | **1.57x** | 61.5% | 37.3% | 20.0% | 2.188 |
+
+**Exp21 vs Exp19 delta:**
+
+| Metric | Exp19 ckpt79 | Exp21 ckpt62 | Delta |
+|--------|-------------|-------------|-------|
+| Acc@0 | 60.3% | 61.5% | **+1.2pp** |
+| Acc@1 | 34.9% | 37.3% | **+2.4pp** |
+| Acc@2 | 17.8% | 20.0% | **+2.2pp** |
+| AccLen | 2.129 | 2.188 | **+0.059** |
+| Speedup | 1.36x | 1.57x | **+0.21x** |
+
+**Observations:**
+- **Exp21 outperforms exp19 across all metrics** when evaluated under identical conditions
+- The initial eval showing exp21 "slightly worse" was due to uncontrolled variables (different nodes, different prompt counts, different baseline throughput)
+- **Higher-order acceptance rates improve more** — Acc@1 (+2.4pp) and Acc@2 (+2.2pp) gain more than Acc@0 (+1.2pp), indicating the draft model learned longer-range token prediction from the expanded dataset
+- 4.4x more training data (724K vs 165K) yields meaningful but modest gains in acceptance rate; the biggest improvement is in throughput speedup (1.57x vs 1.36x)
+- Exp21 achieved this with fewer effective epochs (62 vs 79) and without difficulty-weighted resampling (still in round 1), suggesting further gains possible with complete pipeline activation
