@@ -202,6 +202,35 @@ Training epoch 1018+, val_loss ~3.2 range. ckpt799 is one of the best-5 checkpoi
 - **最佳 checkpoint**：ckpt217 (long 1.18x) 或 ckpt799 (long 1.17x) 性能相当，ckpt217 更早获得
 - **结论**：进一步提升需要改变数据分布、架构或训练策略
 
+### ZClawBench Eval — ThoughtWorks Eagle3 比较 (2026-04-13)
+
+模型：`thoughtworks/MiniMax-M2.5-Eagle3`（HuggingFace，Apache 2.0）  
+训练数据：英文 coding（HumanEval/SWEBench/Aider），20K 样本  
+评测：vLLM + ZClawBench（中文，92% 中文或中英混合），num_speculative_tokens=3
+
+#### ZClawBench 结果
+
+| Bucket | Baseline Tok/s | TW Eagle3 Tok/s | Speedup | Acc@0 | AccLen |
+|--------|---------------|----------------|---------|-------|--------|
+| Simple (116) | 4103.0 | 3932.1 | 0.96x | 40.1% | 1.789 |
+| Short 0-2K (210) | 5392.6 | 3584.8 | 0.66x | 38.9% | 1.702 |
+| Med 2K-8K (320) | 2330.3 | 2410.6 | 1.03x | 42.1% | 1.726 |
+| Long 8K-32K (119) | 907.6 | 974.1 | **1.07x** | 39.2% | 1.616 |
+
+#### 与 Exp20-3 ckpt799 对比
+
+| Model | Simple | Short | Med | Long | Acc@0 (long) |
+|-------|--------|-------|-----|------|--------------|
+| ThoughtWorks Eagle3 | 0.96x | 0.66x | 1.03x | 1.07x | 39.2% |
+| **Exp20-3 ckpt799** | **1.16x** | **0.75x** | **1.12x** | **1.17x** | **58.4%** |
+
+#### Analysis
+
+- **ThoughtWorks 在 ZClawBench 上明显弱于 Exp20-3**：long 1.07x vs 1.17x，Acc@0 长上下差约 19 个百分点
+- **原因**：ThoughtWorks 训练数据为英文 coding（HumanEval/SWEBench），ZClawBench 为 92% 中文内容，分布不匹配
+- **ThoughtWorks 发布的数字（2.11x HumanEval）为 SGLang + 8 draft tokens + 英文场景**，与此次测试（vLLM + 3 tokens + 中文）不可比
+- **结论**：中文场景下，针对目标分布定制训练（Exp20-3）远优于通用英文 coding 草稿模型
+
 ---
 
 ## Notes
