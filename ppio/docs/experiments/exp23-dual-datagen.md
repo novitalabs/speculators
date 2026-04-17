@@ -1,6 +1,6 @@
 # Experiment 23: Dual TP=4 Datagen
 
-## Status: RUNNING (epoch 150+, val_acc@0 peak ~0.761) | ckpt145 eval: novita 1.58x / ZClaw 1.12x
+## Status: RUNNING (epoch 350+) | Best: ckpt349 novita **1.70x** / ckpt181 ZClaw **1.21x**
 
 ## Motivation
 
@@ -69,9 +69,9 @@ Same as exp22 — 8-GPU FSDP on .18, Aurora architecture.
 |--------|-------|----------------|---------------|
 | Datagen throughput | ~2,500 files/hr | ~5,000 files/hr | **~13,200 files/hr** ✓ |
 | Mean sample train_count | 26.7x | ≤15x | TBD |
-| novita_merged_eval speedup | 1.67x (ckpt230) | ≥1.50x | **1.58x ✓** (ckpt145, non-peak) |
-| ZClaw speedup | 1.12x (ckpt224) | ≥1.20x | **1.12x** (ckpt145) |
-| ZClaw Acc@0 | 53.1% (ckpt224) | ≥50% | **53.5% ✓** (ckpt145) |
+| novita_merged_eval speedup | 1.67x (ckpt230) | ≥1.50x | **1.70x ✓** (ckpt349) |
+| ZClaw speedup | 1.12x (ckpt224) | ≥1.20x | **1.21x ✓** (ckpt181) |
+| ZClaw Acc@0 | 53.1% (ckpt224) | ≥50% | **54.6% ✓** (ckpt181) |
 
 ## Results
 
@@ -123,6 +123,13 @@ Process B 速率 (110 files/min) 高于 exp22 单进程 (42 files/min) 约 2.6x�
 **Root cause**: Transient GPU communication failure on node .18 — recurring issue (3rd occurrence: exp22 ckpt33, exp22 ckpt384, now exp23 ckpt34).  
 **Fix**: Deleted + recreated train pod; will auto-resume from ckpt31 (ckpt32 logged as saved but absent from checkpoints dir, likely incomplete flush at crash time). Epochs 32–33 will re-train.
 
+### Issue 3: NCCL AllGather Timeout (epoch ~183)
+
+**When**: 2026-04-16 07:31 UTC, epoch 182 complete, crash during epoch 183  
+**Symptom**: SIGABRT on rank 5 first, then all ranks. Same 30-min watchdog pattern. 4th occurrence on node .18 (exp22×2, exp23×3).  
+**Root cause**: Recurring GPU communication failure on node .18 — hardware issue, not code-related.  
+**Fix**: Deleted + recreated train pod; auto-resumes from ckpt182.
+
 ### 2026-04-16 — Training progress (epoch 148, strong convergence)
 
 Resumed from ckpt31 post-crash, now at epoch 149. No further NCCL crashes since Issue 2.
@@ -140,7 +147,18 @@ Resumed from ckpt31 post-crash, now at epoch 149. No further NCCL crashes since 
 | 147 | 0.753 | 3.559 | ckpt saved |
 | **148** | **0.748** | **3.477** | ckpt saved; epoch 149 now running |
 
-Saved checkpoints: 14, 15, 16 (run 1), 24, 31 (run 2 early), 132, 145, 146, 147, 148
+Saved checkpoints: 14, 15, 16 (run 1), 24, 31 (run 2 early), 132, 145 (run 2 mid), 174, 181, 182 (run 3 latest)
+
+Recent epochs (run 3, post-crash-2 resume from ckpt31):
+
+| Epoch | val_acc@0 | val_loss | Notes |
+|-------|-----------|----------|-------|
+| 178 | 0.757 | **3.286** | Best val_loss so far |
+| **179** | **0.766** | 3.424 | **New peak val_acc@0** |
+| 180 | 0.749 | 3.534 | |
+| 181 | 0.762 | 3.301 | ckpt saved |
+| 182 | 0.745 | 3.466 | ckpt saved (latest before crash) |
+| 183 | 0.751 | 3.360 | crash mid-epoch |
 
 **Comparison vs baselines：**
 
@@ -149,9 +167,9 @@ Saved checkpoints: 14, 15, 16 (run 1), 24, 31 (run 2 early), 132, 145, 146, 147,
 | Exp19 | ~0.60 | ckpt5 |
 | Exp21 | 0.668 | 62 |
 | Exp22 | 0.714 | 120 |
-| **Exp23** | **0.761** | **~146** |
+| **Exp23** | **0.766** | **179** |
 
-Exp23 峰值比 exp22 高 **+4.7pp**，验证了 dual datagen 减少样本复用（target ~10x vs exp22 的 26.7x）可显著提升模型质量。val_acc@0 在 0.74–0.76 附近波动，仍接近峰值，训练继续。
+Exp23 峰值比 exp22 高 **+5.2pp**，且仍在继续改善（val_loss 新低 3.286 at epoch 178）。
 
 **Datagen 状态（2026-04-16）：**
 
@@ -184,3 +202,31 @@ Eval pod on .28 (4 GPUs, TP=4). Checkpoint 2.6GB, copied from .18 → .28.
 - ZClaw 1.12x 直接追平 exp22 ckpt224，Acc@0 53.5% 微超；
 - novita 1.58x 略低于 exp22 ckpt230 的 1.67x，但 ckpt230 是 exp22 的较晚 checkpoint；
 - 期待峰值 ckpt（~epoch 146）会进一步提升，尤其 novita 方向。
+
+### 2026-04-17 — Eval ckpt181 + ckpt349 (novita_merged_eval + ZClawBench，节点 .17)
+
+Eval pod on .17 (4 GPUs, TP=4)。Datagen pod 停掉以释放 .17 GPU。
+
+| Name | Benchmark | Tok/s | Speedup | Acc@0 | Acc@1 | Acc@2 | AccLen |
+|------|-----------|-------|---------|-------|-------|-------|--------|
+| baseline | novita_merged_eval | 2708.5 | 1.00x | — | — | — | — |
+| baseline | zclawbench | 3999.0 | 1.00x | — | — | — | — |
+| exp23_ckpt181 | novita_merged_eval | 4311.7 | **1.59x** | 0.680 | 0.433 | 0.256 | 2.369 |
+| exp23_ckpt181 | zclawbench | 4821.0 | **1.21x** | 0.546 | 0.265 | 0.132 | 1.942 |
+| exp23_ckpt349 | novita_merged_eval | 4616.4 | **1.70x** | 0.670 | 0.420 | 0.245 | 2.335 |
+| exp23_ckpt349 | zclawbench | 4389.3 | **1.10x** | 0.513 | 0.235 | 0.113 | 1.862 |
+
+**全实验最佳对比：**
+
+| Checkpoint | novita_merged_eval | ZClaw speedup | ZClaw Acc@0 |
+|-----------|-------------------|---------------|-------------|
+| exp22 ckpt224 | 1.52x | 1.12x | 53.1% |
+| exp22 ckpt230 | 1.67x | 1.05x | 52.1% |
+| exp23 ckpt145 | 1.58x | 1.12x | 53.5% |
+| **exp23 ckpt181** | 1.59x | **1.21x** ✓ | **54.6%** ✓ |
+| **exp23 ckpt349** | **1.70x** ✓ | 1.10x | 51.3% |
+
+**Analysis**：
+- ckpt181（val_acc@0 峰值 0.762）：ZClaw **1.21x**，首次超过 ≥1.20x 目标，Acc@0=54.6% 全局最高。
+- ckpt349（val_acc@0=0.746，past-peak）：novita **1.70x**，超越 exp22 最佳 1.67x。符合 exp22 规律——更靠后的 ckpt 在 novita 上继续提升，但 ZClaw 下降。
+- Dual datagen 双赢验证：novita 1.70x + ZClaw 1.21x，两项均超 exp22 全局最佳。
