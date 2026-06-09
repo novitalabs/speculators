@@ -271,27 +271,7 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
         # subclass like Eagle3SpeculatorConfig has a synthetic __init__ that
         # shadows this class's __init__ — so the materialization below must live
         # here, not in __init__).
-        #
-        # Materialize any field still holding its class-level ``FieldInfo``. The
-        # custom ``__new__`` pre-seeds ``__pydantic_fields_set__`` which causes
-        # Pydantic to skip applying defaults for unset fields, so ``getattr``
-        # returns the FieldInfo descriptor. That later leaks into
-        # ``to_dict``/``to_diff_dict`` and breaks JSON serialization in
-        # ``save_pretrained`` ("Object of type FieldInfo is not JSON
-        # serializable"). Resolve each unset field to its real default.
-        from pydantic_core import PydanticUndefined
-
-        for name, field in type(self).model_fields.items():
-            current = getattr(self, name, None)
-            if isinstance(current, FieldInfo):
-                if field.default_factory is not None:
-                    default = field.default_factory()  # type: ignore[call-arg]
-                elif field.default is not PydanticUndefined:
-                    default = field.default
-                else:
-                    default = None
-                object.__setattr__(self, name, default)
-                self.__pydantic_fields_set__.add(name)
+        self._materialize_field_defaults()
 
         # manually set PretrainedConfig attributes
         object.__setattr__(self, 'transformers_version', version("transformers"))
@@ -299,16 +279,27 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
     def validate(self) -> None:
         """transformers PretrainedConfig.validate() hook.
 
-        transformers>=5 calls ``self.validate()`` during ``save_pretrained`` to
-        run strict-dataclass class validators. Because this config also subclasses
-        Pydantic ``BaseModel``, the MRO would otherwise resolve ``.validate`` to
-        Pydantic's deprecated ``BaseModel.validate(value)`` classmethod and crash
-        with "missing 1 required positional argument: 'value'". Pydantic already
-        validates on construction, so run any transformers class validators if
-        present and otherwise no-op.
+        transformers calls ``self.validate()`` during some ``save_pretrained``
+        paths. Because this config also subclasses Pydantic ``BaseModel``, the MRO
+        would otherwise resolve ``.validate`` to Pydantic's deprecated
+        ``BaseModel.validate(value)`` classmethod and crash with "missing 1
+        required positional argument: 'value'". Pydantic already validates on
+        construction, so this override only needs to neutralize that collision.
+
+        Future-proofing: if a real ``PretrainedConfig.validate`` *instance* method
+        ever exists (i.e. defined somewhere in the MRO other than Pydantic's
+        ``BaseModel``), dispatch to it so HF's own config validation is not
+        silently skipped. As of transformers 5.x no such method exists, so this
+        is a no-op there.
         """
-        for validator in getattr(type(self), "__class_validators__", ()):  # type: ignore[attr-defined]
-            validator(self)
+        for klass in type(self).__mro__:
+            if klass in (SpeculatorModelConfig, BaseModel):
+                # our override / the deprecated Pydantic classmethod — skip both
+                continue
+            hf_validate = klass.__dict__.get("validate")
+            if hf_validate is not None:
+                hf_validate(self)
+                return
 
     def _materialize_field_defaults(self) -> None:
         """Resolve any field still holding its class-level ``FieldInfo``.
@@ -319,22 +310,32 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
         for subclasses with a synthetic ``__init__``). Unset fields then return
         their ``FieldInfo`` descriptor via ``getattr`` and leak into serialization,
         breaking ``save_pretrained`` with "Object of type FieldInfo is not JSON
-        serializable". Call this at the start of ``to_dict`` so both the real
-        instance and the bare ``self.__class__()`` default instance transformers
-        builds for diffing are sanitized.
+        serializable".
+
+        Resolution uses ``FieldInfo.get_default(call_default_factory=True)`` so
+        mutable/factory defaults are properly (deep-)copied per instance rather
+        than shared. A leaked field with NO default (``PydanticUndefined``) means a
+        required field was never set — that is a genuine construction bug, so we
+        raise rather than fabricate ``None`` and serialize an invalid config.
+
+        This is idempotent and must NOT touch ``__pydantic_fields_set__``: a field
+        resolved to its default is, by Pydantic semantics, *not* explicitly set,
+        and adding it would corrupt later ``model_dump(exclude_unset=True)`` / diff
+        behavior as a serialization side effect.
         """
         from pydantic_core import PydanticUndefined
 
         for name, field in type(self).model_fields.items():
             if isinstance(getattr(self, name, None), FieldInfo):
-                if field.default_factory is not None:
-                    default = field.default_factory()  # type: ignore[call-arg]
-                elif field.default is not PydanticUndefined:
-                    default = field.default
-                else:
-                    default = None
+                default = field.get_default(call_default_factory=True)
+                if default is PydanticUndefined:
+                    raise ValueError(
+                        f"{type(self).__name__}.{name} is a required field but was "
+                        "never set (it still holds its FieldInfo default). This "
+                        "indicates the Pydantic fast-path skipped its validation; "
+                        "construct the config with all required fields."
+                    )
                 object.__setattr__(self, name, default)
-                self.__pydantic_fields_set__.add(name)
 
     def to_dict(self) -> dict[str, Any]:
         """

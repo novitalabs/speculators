@@ -516,3 +516,46 @@ def test_speculator_model_config_from_pretrained_conversion(sample_speculators_c
     assert "Loading a non-speculator model config is not supported yet" in str(
         exc_info.value
     )
+
+
+def test_eagle3_to_dict_does_not_mutate_fields_set():
+    # to_dict() materializes leaked FieldInfo defaults so serialization works,
+    # but must NOT add those names to __pydantic_fields_set__. That set is
+    # Pydantic semantic state (fields explicitly supplied); mutating it during
+    # serialization would corrupt later model_dump(exclude_unset=True)/diff
+    # behavior as a side effect. to_dict must also be idempotent.
+    config = Eagle3SpeculatorConfig()
+    before = set(config.__pydantic_fields_set__)
+    config.to_dict()
+    config.to_dict()
+    assert set(config.__pydantic_fields_set__) == before
+
+
+def test_eagle3_factory_defaults_are_per_instance_not_shared():
+    # _materialize_field_defaults must use FieldInfo.get_default(call_default_factory=True)
+    # so mutable/factory defaults (e.g. transformer_layer_config) are copied per
+    # instance rather than shared across configs.
+    a = Eagle3SpeculatorConfig()
+    a.to_dict()
+    b = Eagle3SpeculatorConfig()
+    b.to_dict()
+    assert a.transformer_layer_config is not b.transformer_layer_config
+
+
+def test_speculator_config_materialize_raises_on_unset_required_field():
+    # A leaked field with no default (PydanticUndefined) signals a required field
+    # that was never set — _materialize_field_defaults must raise rather than
+    # fabricate None and serialize an invalid config.
+    from pydantic.fields import FieldInfo
+
+    config = Eagle3SpeculatorConfig()
+    # Simulate a required field (no default) that leaked as its FieldInfo: patch
+    # model_fields so the resolver sees a required field, and stash a FieldInfo
+    # on the instance so the isinstance() leak check fires.
+    required_field = FieldInfo(annotation=int)  # no default => required
+    patched = dict(type(config).model_fields)
+    patched["draft_vocab_size"] = required_field
+    with patch.object(type(config), "model_fields", patched):
+        object.__setattr__(config, "draft_vocab_size", required_field)
+        with pytest.raises(ValueError, match="required field"):
+            config._materialize_field_defaults()
