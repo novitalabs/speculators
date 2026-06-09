@@ -33,8 +33,9 @@ class BaseCheckpointer:
         ...
     """
 
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, max_checkpoints: int | None = None):
         self.path = Path(path)
+        self.max_checkpoints = max_checkpoints
         self.previous_epoch = self._get_previous_epoch()
 
         if self.previous_epoch != -1:
@@ -82,6 +83,21 @@ class BaseCheckpointer:
     ):
         raise NotImplementedError
 
+    def _prune_old_checkpoints(self, current_epoch: int) -> None:
+        """Delete checkpoint dirs older than (current_epoch - max_checkpoints + 1)."""
+        if self.max_checkpoints is None or self.max_checkpoints <= 0:
+            return
+        cutoff = current_epoch - self.max_checkpoints  # keep epochs > cutoff
+        for d in sorted(self.path.iterdir()):
+            if d.is_dir():
+                try:
+                    epoch_num = int(d.name)
+                except ValueError:
+                    continue
+                if epoch_num <= cutoff:
+                    import shutil
+                    shutil.rmtree(d)
+
     def _get_previous_epoch(self) -> int:
         if not self.path.exists():
             return -1
@@ -89,14 +105,22 @@ class BaseCheckpointer:
         for d in self.path.iterdir():
             if d.is_dir():
                 try:
-                    last_checkpoint_num = max(last_checkpoint_num, int(d.name))
+                    epoch_num = int(d.name)
                 except ValueError:
                     continue
+                if (d / "model.safetensors").exists() or (d / "model.safetensors.index.json").exists():
+                    last_checkpoint_num = max(last_checkpoint_num, epoch_num)
         return last_checkpoint_num
 
     def model_path(self, epoch: int):
-        model_fname = "model.safetensors"
-        return self.path / str(epoch) / model_fname
+        epoch_dir = self.path / str(epoch)
+        single = epoch_dir / "model.safetensors"
+        if single.exists():
+            return single
+        index = epoch_dir / "model.safetensors.index.json"
+        if index.exists():
+            return index
+        return single
 
     def optimizer_path(self, epoch: int):
         optimizer_fname = "optimizer_state_dict.pt"
@@ -117,10 +141,21 @@ def convert_float_dtype(sd: pytree.PyTree, dtype: torch.dtype) -> pytree.PyTree:
 
 
 def load_safetensors_state_dict(path: Path, device: str) -> dict[str, torch.Tensor]:
+    import json as _json
     full_state_dict = {}
-    with safe_open(path, framework="pt", device=device) as f:
-        for key in f.keys():  # noqa: SIM118
-            full_state_dict[key] = f.get_tensor(key)
+    if path.name.endswith(".index.json"):
+        with open(path) as f:
+            index = _json.load(f)
+        shard_files = set(index["weight_map"].values())
+        for shard_file in sorted(shard_files):
+            shard_path = path.parent / shard_file
+            with safe_open(shard_path, framework="pt", device=device) as f:
+                for key in f.keys():
+                    full_state_dict[key] = f.get_tensor(key)
+    else:
+        with safe_open(path, framework="pt", device=device) as f:
+            for key in f.keys():
+                full_state_dict[key] = f.get_tensor(key)
     return full_state_dict
 
 
@@ -154,7 +189,13 @@ class SingleGPUCheckpointer(BaseCheckpointer):
         full_state_dict = convert_float_dtype(
             full_state_dict, float_dtype or model.dtype
         )
-        optimizer.load_state_dict(full_state_dict)
+        try:
+            optimizer.load_state_dict(full_state_dict)
+        except (ValueError, KeyError) as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Failed to load optimizer state (starting fresh optimizer): %s", e
+            )
 
     def save_checkpoint(
         self,
@@ -167,6 +208,7 @@ class SingleGPUCheckpointer(BaseCheckpointer):
         model.save_pretrained(self.path / str(epoch), state_dict=model_state_dict)
         optimizer_state_dict = convert_float_dtype(optimizer.state_dict(), float_dtype)
         torch.save(optimizer_state_dict, self.optimizer_path(epoch))
+        self._prune_old_checkpoints(epoch)
 
 
 class DistributedCheckpointer(BaseCheckpointer):
@@ -206,12 +248,18 @@ class DistributedCheckpointer(BaseCheckpointer):
             full_state_dict, float_dtype or model.dtype
         )
 
-        set_optimizer_state_dict(
-            model,
-            optimizer,
-            full_state_dict,
-            options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True),
-        )
+        try:
+            set_optimizer_state_dict(
+                model,
+                optimizer,
+                full_state_dict,
+                options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True),
+            )
+        except (ValueError, KeyError) as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Failed to load optimizer state (starting fresh optimizer): %s", e
+            )
         dist.barrier()
 
     def save_checkpoint(
@@ -237,5 +285,6 @@ class DistributedCheckpointer(BaseCheckpointer):
             # Only rank 0 saves the checkpoint
             model.save_pretrained(self.path / str(epoch), state_dict=model_state_dict)
             torch.save(optimizer_state_dict, self.optimizer_path(epoch))
+            self._prune_old_checkpoints(epoch)
 
         dist.barrier()

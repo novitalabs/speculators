@@ -63,7 +63,7 @@ def shift_batch(batch: BatchType):
     lengths = lengths - 1
     position_ids = position_ids[1:]  # Note: position_ids now start at 1
 
-    return {
+    result = {
         "input_ids": input_ids,
         "hidden_states": hidden_states,
         "verifier_last_hidden_states": verifier_last_hidden_states,
@@ -71,6 +71,11 @@ def shift_batch(batch: BatchType):
         "lengths": lengths,
         "position_ids": position_ids,
     }
+    # Pass through top-K verifier logits (shift to align with targets)
+    if "top_logits_values" in batch:
+        result["top_logits_values"] = batch["top_logits_values"][1:]
+        result["top_logits_indices"] = batch["top_logits_indices"][1:]
+    return result
 
 
 def split_files(datapath: str, ratio: float = 0.9, seed: int = 0):
@@ -271,6 +276,165 @@ def create_collate_fn(max_len: int):
             new_lengths.append(length)
             cum_length += length
         collated_data["lengths"] = torch.tensor(new_lengths, dtype=torch.long)
+
+        # Regenerate position_ids from lengths after truncation
+        # (original per-sample position_ids may exceed max_len after shift_batch)
+        import torch as _torch
+        pos = []
+        for length in new_lengths:
+            pos.append(_torch.arange(length, dtype=_torch.long))
+        pos_cat = _torch.cat(pos)
+        if pos_cat.numel() < max_len:
+            pos_cat = _torch.cat([pos_cat, _torch.zeros(max_len - pos_cat.numel(), dtype=_torch.long)])
+        final_pos = pos_cat[:max_len].unsqueeze(0)
+        assert final_pos.max() < max_len, f"COLLATE BUG: pos max={final_pos.max()} >= max_len={max_len}, lengths={new_lengths}"
+        collated_data["position_ids"] = final_pos
+
         return collated_data
 
     return collate_fn
+
+
+
+def process_generated_sample(
+    raw_data: dict[str, Any],
+    loss_mask: torch.Tensor,
+    standardize_fn: StandardizeFnSig = standardize_data_v1,
+    transform: TransformTensors | None = None,
+    hidden_states_dtype: torch.dtype = torch.float,
+) -> BatchType:
+    """Process a single sample from VllmHiddenStatesGenerator into a training-ready batch item.
+
+    This is the shared preprocessing path used by both offline (Eagle3SampleFileDataset)
+    and dynamic (DynamicTrainer) training to ensure identical data transformation.
+
+    Args:
+        raw_data: Dict with keys "input_ids" (Tensor[seq]), "hidden_states" (list of Tensors),
+                  and optionally "loss_mask".
+        loss_mask: External loss mask tensor to use (from dataset preprocessing).
+        standardize_fn: Standardization function (e.g. standardize_data_v1).
+        transform: Optional noise transform (e.g. AddUniformNoise).
+        hidden_states_dtype: Target dtype for hidden states tensors.
+
+    Returns:
+        Shifted, ready-to-collate batch dict with keys:
+        {hidden_states, input_ids, verifier_last_hidden_states, loss_mask, lengths, position_ids}
+    """
+    seq_len = len(raw_data["input_ids"])
+
+    # Merge external loss_mask (generator returns None)
+    data = {
+        "input_ids": raw_data["input_ids"],
+        "hidden_states": raw_data["hidden_states"],
+        "loss_mask": loss_mask[:seq_len],
+    }
+
+    data = standardize_fn(data)
+
+    # Convert hidden states dtype (same as Eagle3SampleFileDataset.__getitem__)
+    data = {
+        k: v.to(hidden_states_dtype) if "hidden_states" in k else v
+        for k, v in data.items()
+    }
+
+    # Add lengths and position_ids
+    out_seq_len = data["input_ids"].shape[0]
+    data["lengths"] = torch.tensor([out_seq_len], dtype=torch.long)
+    data["position_ids"] = torch.arange(out_seq_len, dtype=torch.long)
+
+    # Apply noise transform
+    if transform:
+        data = transform(data)
+
+    return shift_batch(data)
+
+
+class DynamicEagle3Dataset(Dataset):
+    """Dataset for dynamic hidden states training.
+
+    Provides only input_ids + loss_mask (no hidden_states).
+    Hidden states are generated on-the-fly by VllmHiddenStatesGenerator in the trainer.
+    """
+
+    def __init__(self, hf_dataset, max_len: int):
+        """
+        Args:
+            hf_dataset: HuggingFace Dataset with columns "input_ids" and "loss_mask".
+            max_len: Maximum sequence length.
+        """
+        self.hf_dataset = hf_dataset
+        self.max_len = max_len
+        self.approx_lengths = [
+            min(len(row["input_ids"]), max_len) for row in hf_dataset
+        ]
+
+    def __len__(self):
+        return len(self.hf_dataset)
+
+    def __getitem__(self, index) -> BatchType:
+        row = self.hf_dataset[index]
+        input_ids = torch.tensor(row["input_ids"], dtype=torch.long)
+        loss_mask = torch.tensor(row["loss_mask"], dtype=torch.long)
+        seq_len = min(len(input_ids), self.max_len)
+        return {
+            "input_ids": input_ids[:seq_len],
+            "loss_mask": loss_mask[:seq_len],
+            "lengths": torch.tensor([seq_len], dtype=torch.long),
+        }
+
+
+def create_dynamic_collate_fn(max_len: int):
+    """Collate function for DynamicEagle3Dataset: packs input_ids + loss_mask only."""
+
+    def collate_fn(batch: list[BatchType]) -> BatchType:
+        collated: BatchType = {}
+        for key in batch[0]:
+            collated[key] = torch.cat([b[key] for b in batch], dim=0)
+            if key != "lengths":
+                collated[key] = slice_and_pad_to_length(
+                    collated[key], max_len
+                ).unsqueeze(0)
+
+        # Truncate lengths to fit max_len (same logic as create_collate_fn)
+        lengths = collated["lengths"]
+        new_lengths: list[int] = []
+        cum = 0
+        for length in lengths:
+            l_val = length.item()
+            if l_val + cum >= max_len:
+                new_lengths.append(max_len - cum)
+                break
+            new_lengths.append(l_val)
+            cum += l_val
+        collated["lengths"] = torch.tensor(new_lengths, dtype=torch.long)
+        return collated
+
+    return collate_fn
+
+
+def standardize_data_mtp(data: dict) -> dict:
+    # MTP data format (single hidden state layer):
+    # {
+    #  'input_ids': [seq_len],
+    #  'loss_mask': [seq_len],
+    #  'hidden_states': [seq_len, hidden_size],   # single tensor (not a list)
+    # }
+    h = data['hidden_states']
+    if isinstance(h, list):
+        h = h[-1]  # use last layer (e.g. layer 60 for K2.5)
+    result = {
+        'hidden_states': h,
+        'input_ids': data['input_ids'],
+        'verifier_last_hidden_states': h,
+        'loss_mask': data['loss_mask'],
+    }
+    # Pass through top-K verifier logits if present (both must exist)
+    has_vals = 'top_logits_values' in data
+    has_ids = 'top_logits_indices' in data
+    if has_vals != has_ids:
+        raise ValueError("top_logits_values and top_logits_indices must both be present or both absent")
+    if has_vals:
+        result['top_logits_values'] = data['top_logits_values']
+        result['top_logits_indices'] = data['top_logits_indices']
+    return result
+

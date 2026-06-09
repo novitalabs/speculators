@@ -1,4 +1,8 @@
 """Extract hidden states from intermediate layers during prefill using vLLM."""
+import os
+# vLLM defaults to fork in library mode, which breaks CUDA re-init for TP>1.
+# Must be set before any vLLM import/initialization.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 import torch
 from transformers import AutoConfig, AutoTokenizer
@@ -79,15 +83,17 @@ class VllmHiddenStatesGenerator:
         gpu_memory_utilization: float = 0.8,
         tensor_parallel_size: int = 1,
         max_num_batched_tokens: int | None = None,
+        enforce_eager: bool = True,
     ):
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
+        self.enforce_eager = enforce_eager
         self._request_counter = 0
 
         log.info(f"Initializing hidden states generator for {model_path}")
         log.info(f"Tensor parallel size: {tensor_parallel_size}")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         if hasattr(config, "num_hidden_layers"):
@@ -121,6 +127,7 @@ class VllmHiddenStatesGenerator:
             gpu_memory_utilization=gpu_memory_utilization,
             tensor_parallel_size=tensor_parallel_size,
             max_num_batched_tokens=max_num_batched_tokens,
+            enforce_eager=enforce_eager,
         )
 
         log.info("Initializing executor...")
@@ -181,6 +188,7 @@ class VllmHiddenStatesGenerator:
         gpu_memory_utilization: float,
         tensor_parallel_size: int,
         max_num_batched_tokens: int | None = None,
+        enforce_eager: bool = True,
     ) -> VllmConfig:
         """Create VllmConfig with hidden states worker extension"""
         cache_config = CacheConfig(
@@ -205,11 +213,12 @@ class VllmHiddenStatesGenerator:
                 trust_remote_code=True,
                 dtype="auto",
                 max_model_len=max_model_len,
-                enforce_eager=True,
+                enforce_eager=enforce_eager,
             ),
             cache_config=cache_config,
             parallel_config=ParallelConfig(
                 tensor_parallel_size=tensor_parallel_size,
+                worker_cls="vllm.v1.worker.gpu_worker.Worker",
                 worker_extension_cls="speculators.data_generation.custom_worker.HiddenStatesWorkerExtension",
             ),
             scheduler_config=SchedulerConfig(
@@ -218,7 +227,7 @@ class VllmHiddenStatesGenerator:
                 max_num_batched_tokens=max_num_batched_tokens,
                 is_encoder_decoder=False,
             ),
-            device_config=DeviceConfig(),
+            device_config=DeviceConfig(device="cuda"),
             load_config=LoadConfig(),
         )
 
@@ -268,7 +277,7 @@ class VllmHiddenStatesGenerator:
                     max_tokens=MAX_DECODE_TOKENS, temperature=SAMPLING_TEMPERATURE
                 ),
                 pooling_params=None,
-                eos_token_id=self.tokenizer.eos_token_id,
+
                 arrival_time=INITIAL_ARRIVAL_TIME,
                 block_hasher=self.block_hasher,
             )
@@ -332,7 +341,7 @@ class VllmHiddenStatesGenerator:
 
         # Map results back to original input order
         results = []
-        for req_id in sorted(request_id_to_idx.keys()):
+        for req_id in sorted(request_id_to_idx.keys(), key=lambda k: request_id_to_idx[k]):
             i = request_id_to_idx[req_id]
 
             if req_id not in request_states_dict:

@@ -11,14 +11,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import ValidationError
 from transformers import PretrainedConfig
+from transformers.models.llama.configuration_llama import LlamaConfig
 
 from speculators import (
     SpeculatorModelConfig,
     SpeculatorsConfig,
     TokenProposalConfig,
     VerifierConfig,
-    reload_and_populate_configs,
+    reload_schemas,
 )
+from speculators.models.eagle3 import Eagle3SpeculatorConfig
 
 # ===== TokenProposalConfig Tests =====
 
@@ -30,7 +32,7 @@ class TokenProposalConfigTest(TokenProposalConfig):
 
 
 # Ensure the schemas are reloaded to include the test proposal type
-reload_and_populate_configs()
+reload_schemas()
 
 
 @pytest.mark.smoke
@@ -237,7 +239,7 @@ class SpeculatorModelConfigTest(SpeculatorModelConfig):
 
 
 # Ensure the schemas are reloaded to include the test proposal type
-reload_and_populate_configs()
+reload_schemas()
 
 
 @pytest.fixture
@@ -274,9 +276,7 @@ def test_speculator_model_config_auto_registry():
     classes = SpeculatorModelConfig.registered_classes()
     class_names = [cls.__name__ for cls in classes]
     assert len(class_names) > 0
-    assert "EagleSpeculatorConfig" in class_names
-    assert "IndependentSpeculatorConfig" in class_names
-    assert "MLPSpeculatorConfig" in class_names
+    assert "Eagle3SpeculatorConfig" in class_names
 
 
 @pytest.mark.smoke
@@ -381,6 +381,97 @@ def test_speculator_model_config_from_pretrained_local_marshalling(
 
 
 @pytest.mark.smoke
+def test_eagle3_speculator_config_pretrained_roundtrip(sample_speculators_config):
+    config = Eagle3SpeculatorConfig(
+        transformer_layer_config=LlamaConfig(
+            vocab_size=163840,
+            hidden_size=7168,
+            intermediate_size=18432,
+            num_hidden_layers=1,
+            num_attention_heads=56,
+            num_key_value_heads=56,
+        ),
+        draft_vocab_size=163840,
+        norm_before_residual=False,
+        embed_requires_grad=False,
+        speculators_config=sample_speculators_config,
+    )
+
+    config_dict = config.to_dict()
+    assert config_dict["speculators_model_type"] == "eagle3"
+    assert config_dict["draft_vocab_size"] == 163840
+
+    diff_dict = config.to_diff_dict()
+    assert diff_dict["speculators_model_type"] == "eagle3"
+    assert diff_dict["draft_vocab_size"] == 163840
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        temp_path = Path(tmp_dir)
+        config.save_pretrained(temp_path)
+        assert (temp_path / "config.json").exists()
+
+        reloaded_config = SpeculatorModelConfig.from_pretrained(temp_path)
+        assert isinstance(reloaded_config, Eagle3SpeculatorConfig)
+        assert reloaded_config.speculators_model_type == "eagle3"
+        assert reloaded_config.draft_vocab_size == 163840
+        assert isinstance(reloaded_config.transformer_layer_config, LlamaConfig)
+
+
+def test_eagle3_speculator_config_default_to_dict_rebuilds_schema():
+    config = Eagle3SpeculatorConfig()
+    config_dict = config.to_dict()
+    assert config_dict["speculators_model_type"] == "eagle3"
+    assert config_dict["draft_vocab_size"] == 32000
+
+
+def test_eagle3_speculator_config_bare_default_serializes_transformer_config():
+    # transformers save_pretrained builds a bare ``__class__()`` for generation
+    # parameter diffing; the transformer_layer_config field can hold its
+    # unresolved FieldInfo default, which previously crashed the serializer with
+    # "'FieldInfo' object has no attribute 'to_diff_dict'".
+    config_dict = Eagle3SpeculatorConfig().__class__().to_dict()
+    assert isinstance(config_dict["transformer_layer_config"], dict)
+
+
+def test_eagle3_speculator_config_allows_extra_attr_assignment():
+    # model_config sets extra="allow"; transformers' custom_object_save assigns
+    # ``auto_map`` (an unknown field) which routes to __pydantic_extra__[name].
+    # __pydantic_extra__ must be a dict, not None, or this raises
+    # "'NoneType' object does not support item assignment".
+    config = Eagle3SpeculatorConfig()
+    config.auto_map = {"AutoConfig": "configuration_eagle3.Eagle3SpeculatorConfig"}
+    assert config.auto_map["AutoConfig"].endswith("Eagle3SpeculatorConfig")
+
+
+def test_eagle3_speculator_config_validate_is_instance_method():
+    # transformers>=5 save_pretrained calls self.validate(); the MRO must not
+    # resolve to Pydantic's deprecated BaseModel.validate(value) classmethod
+    # (which crashes with "missing 1 required positional argument: 'value'").
+    Eagle3SpeculatorConfig().validate()
+
+
+def test_eagle3_speculator_config_bare_default_has_no_fieldinfo_leak():
+    # With some pydantic builds the custom __new__ caused BaseModel.__init__ to
+    # skip default application, leaving fields holding their class-level
+    # FieldInfo. That leaked into to_diff_dict / to_json_string and crashed
+    # save_pretrained with "Object of type FieldInfo is not JSON serializable".
+    from pydantic.fields import FieldInfo
+
+    config = Eagle3SpeculatorConfig()
+    for name in (
+        "eagle_aux_hidden_state_layer_ids",
+        "embed_requires_grad",
+        "draft_vocab_size",
+        "target_hidden_size",
+        "norm_before_residual",
+        "architectures",
+    ):
+        assert not isinstance(getattr(config, name), FieldInfo), name
+    # the exact call that crashed in transformers save_pretrained
+    assert config.to_json_string(use_diff=True)
+
+
+@pytest.mark.smoke
 def test_speculator_model_config_from_pretrained_hf_hub(sample_speculators_config):
     config_data = {
         "speculators_model_type": "test_model",
@@ -425,3 +516,46 @@ def test_speculator_model_config_from_pretrained_conversion(sample_speculators_c
     assert "Loading a non-speculator model config is not supported yet" in str(
         exc_info.value
     )
+
+
+def test_eagle3_to_dict_does_not_mutate_fields_set():
+    # to_dict() materializes leaked FieldInfo defaults so serialization works,
+    # but must NOT add those names to __pydantic_fields_set__. That set is
+    # Pydantic semantic state (fields explicitly supplied); mutating it during
+    # serialization would corrupt later model_dump(exclude_unset=True)/diff
+    # behavior as a side effect. to_dict must also be idempotent.
+    config = Eagle3SpeculatorConfig()
+    before = set(config.__pydantic_fields_set__)
+    config.to_dict()
+    config.to_dict()
+    assert set(config.__pydantic_fields_set__) == before
+
+
+def test_eagle3_factory_defaults_are_per_instance_not_shared():
+    # _materialize_field_defaults must use FieldInfo.get_default(call_default_factory=True)
+    # so mutable/factory defaults (e.g. transformer_layer_config) are copied per
+    # instance rather than shared across configs.
+    a = Eagle3SpeculatorConfig()
+    a.to_dict()
+    b = Eagle3SpeculatorConfig()
+    b.to_dict()
+    assert a.transformer_layer_config is not b.transformer_layer_config
+
+
+def test_speculator_config_materialize_raises_on_unset_required_field():
+    # A leaked field with no default (PydanticUndefined) signals a required field
+    # that was never set — _materialize_field_defaults must raise rather than
+    # fabricate None and serialize an invalid config.
+    from pydantic.fields import FieldInfo
+
+    config = Eagle3SpeculatorConfig()
+    # Simulate a required field (no default) that leaked as its FieldInfo: patch
+    # model_fields so the resolver sees a required field, and stash a FieldInfo
+    # on the instance so the isinstance() leak check fires.
+    required_field = FieldInfo(annotation=int)  # no default => required
+    patched = dict(type(config).model_fields)
+    patched["draft_vocab_size"] = required_field
+    with patch.object(type(config), "model_fields", patched):
+        object.__setattr__(config, "draft_vocab_size", required_field)
+        with pytest.raises(ValueError, match="required field"):
+            config._materialize_field_defaults()

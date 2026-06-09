@@ -1,13 +1,7 @@
-from .eagle import EagleSpeculator, EagleSpeculatorConfig
 from .eagle3 import Eagle3DraftModel, Eagle3SpeculatorConfig
-from .independent import IndependentSpeculatorConfig
-from .mlp import MLPSpeculatorConfig
+from .mtp import MTPDraftModel, MTPSpeculatorConfig
 
 __all__ = [
-    "Eagle3DraftModel",
-    "Eagle3SpeculatorConfig",
-    "EagleSpeculator",
-    "EagleSpeculatorConfig",
-    "IndependentSpeculatorConfig",
-    "MLPSpeculatorConfig",
+    "Eagle3DraftModel", "Eagle3SpeculatorConfig",
+    "MTPDraftModel", "MTPSpeculatorConfig",
 ]

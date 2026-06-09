@@ -22,50 +22,20 @@ import os
 from importlib.metadata import version
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field
+import torch
+from pydantic import BaseModel, ConfigDict, Field, PydanticUserError
+from pydantic.fields import FieldInfo
 from transformers import PretrainedConfig
 
+from speculators.proposals import TokenProposalConfig
 from speculators.utils import PydanticClassRegistryMixin, ReloadableBaseModel
 
 __all__ = [
     "SpeculatorModelConfig",
     "SpeculatorsConfig",
-    "TokenProposalConfig",
     "VerifierConfig",
-    "reload_and_populate_configs",
+    "reload_schemas",
 ]
-
-
-class TokenProposalConfig(PydanticClassRegistryMixin):
-    """
-    The base config for a token proposal method which defines how tokens are generated
-    by the speculator, how they are passed to the verifier, and how they are scored
-    for acceptance or rejection. All implementations of token proposal methods
-    must inherit from this class, set the proposal_type to a unique value, and
-    add any additional parameters needed to instantiate and implement the method.
-
-    It uses pydantic to validate the parameters, provide default values, and
-    enable automatic serialization and deserialization of the correct class
-    types based on the proposal_type field.
-    """
-
-    @classmethod
-    def __pydantic_schema_base_type__(cls) -> type["TokenProposalConfig"]:
-        if cls.__name__ == "TokenProposalConfig":
-            return cls
-
-        return TokenProposalConfig
-
-    auto_package: ClassVar[str] = "speculators.proposals"
-    registry_auto_discovery: ClassVar[bool] = True
-    schema_discriminator: ClassVar[str] = "proposal_type"
-
-    proposal_type: str = Field(
-        description=(
-            "The type of token proposal the config is for. "
-            "Must be a supported proposal type from the Speculators repo."
-        ),
-    )
 
 
 class VerifierConfig(BaseModel):
@@ -268,7 +238,7 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
         description="The type of model from the Speculators repo this config is for.",
     )
     speculators_version: str = Field(
-        default=version("speculators"),
+        default="0.5.0",
         description="Version of the speculators library",
     )
     speculators_config: SpeculatorsConfig = Field(  # type: ignore[assignment]
@@ -279,27 +249,108 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
         ),
     )
 
+    def __new__(cls, **kwargs):
+        # create instance without calling __init__ yet
+        instance = object.__new__(cls)
+        # pre-initialize Pydantic internal state BEFORE any __init__ runs
+        object.__setattr__(instance, '__pydantic_fields_set__', set())
+        # model_config sets extra="allow", so __pydantic_extra__ must be a dict
+        # (None is only valid for extra="ignore"/"forbid"). transformers' save
+        # path assigns unknown attrs like ``auto_map`` which route through
+        # __pydantic_extra__[name] = value and would fail on None.
+        object.__setattr__(instance, '__pydantic_extra__', {})
+        object.__setattr__(instance, '__pydantic_private__', None)
+        return instance
+
     def __init__(self, **kwargs):
-        # initialize the Pydantic arguments first to set all valid fields
-        PydanticClassRegistryMixin.__init__(self, **kwargs)
+        # now safe to call BaseModel.__init__ with __pydantic_fields_set__ already present
+        BaseModel.__init__(self, **kwargs)
 
-        # reset kwargs handled by Pydantic so PretrainedConfig doesn't override
-        for field in self.__class__.model_fields:
-            kwargs[field] = getattr(self, field)
+    def model_post_init(self, __context) -> None:
+        # Runs for every subclass after validation (Pydantic calls it even when a
+        # subclass like Eagle3SpeculatorConfig has a synthetic __init__ that
+        # shadows this class's __init__ — so the materialization below must live
+        # here, not in __init__).
+        self._materialize_field_defaults()
 
-        # initialize the Hugging Face PretrainedConfig arguments for the model
-        PretrainedConfig.__init__(self, **kwargs)
+        # manually set PretrainedConfig attributes
+        object.__setattr__(self, 'transformers_version', version("transformers"))
 
-        # ensure we always update the transformers version
-        self.transformers_version = version("transformers")
+    def validate(self) -> None:
+        """transformers PretrainedConfig.validate() hook.
+
+        transformers calls ``self.validate()`` during some ``save_pretrained``
+        paths. Because this config also subclasses Pydantic ``BaseModel``, the MRO
+        would otherwise resolve ``.validate`` to Pydantic's deprecated
+        ``BaseModel.validate(value)`` classmethod and crash with "missing 1
+        required positional argument: 'value'". Pydantic already validates on
+        construction, so this override only needs to neutralize that collision.
+
+        Future-proofing: if a real ``PretrainedConfig.validate`` *instance* method
+        ever exists (i.e. defined somewhere in the MRO other than Pydantic's
+        ``BaseModel``), dispatch to it so HF's own config validation is not
+        silently skipped. As of transformers 5.x no such method exists, so this
+        is a no-op there.
+        """
+        for klass in type(self).__mro__:
+            if klass in (SpeculatorModelConfig, BaseModel):
+                # our override / the deprecated Pydantic classmethod — skip both
+                continue
+            hf_validate = klass.__dict__.get("validate")
+            if hf_validate is not None:
+                hf_validate(self)
+                return
+
+    def _materialize_field_defaults(self) -> None:
+        """Resolve any field still holding its class-level ``FieldInfo``.
+
+        The custom ``__new__`` pre-seeds ``__pydantic_fields_set__``/``__pydantic_extra__``
+        which makes Pydantic's ``validate_python`` take a fast path that skips
+        applying defaults for unset fields (and skips ``__init__``/``model_post_init``
+        for subclasses with a synthetic ``__init__``). Unset fields then return
+        their ``FieldInfo`` descriptor via ``getattr`` and leak into serialization,
+        breaking ``save_pretrained`` with "Object of type FieldInfo is not JSON
+        serializable".
+
+        Resolution uses ``FieldInfo.get_default(call_default_factory=True)`` so
+        mutable/factory defaults are properly (deep-)copied per instance rather
+        than shared. A leaked field with NO default (``PydanticUndefined``) means a
+        required field was never set — that is a genuine construction bug, so we
+        raise rather than fabricate ``None`` and serialize an invalid config.
+
+        This is idempotent and must NOT touch ``__pydantic_fields_set__``: a field
+        resolved to its default is, by Pydantic semantics, *not* explicitly set,
+        and adding it would corrupt later ``model_dump(exclude_unset=True)`` / diff
+        behavior as a serialization side effect.
+        """
+        from pydantic_core import PydanticUndefined
+
+        for name, field in type(self).model_fields.items():
+            if isinstance(getattr(self, name, None), FieldInfo):
+                default = field.get_default(call_default_factory=True)
+                if default is PydanticUndefined:
+                    raise ValueError(
+                        f"{type(self).__name__}.{name} is a required field but was "
+                        "never set (it still holds its FieldInfo default). This "
+                        "indicates the Pydantic fast-path skipped its validation; "
+                        "construct the config with all required fields."
+                    )
+                object.__setattr__(self, name, default)
 
     def to_dict(self) -> dict[str, Any]:
         """
         :return: A dictionary representation of the full config, including the
             PretrainedConfig variables and Pydantic model fields.
         """
+        self._materialize_field_defaults()
         pretrained_dict = super().to_dict()
-        model_dict = self.model_dump()
+        try:
+            model_dict = self.model_dump()
+        except PydanticUserError as exc:
+            if exc.code != "class-not-fully-defined":
+                raise
+            self.__class__.model_rebuild(force=True, _types_namespace={"torch": torch})
+            model_dict = self.model_dump()
         config_dict = {**pretrained_dict, **model_dict}
 
         # strip all class variables and metadata that are not needed in the output
@@ -330,12 +381,12 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
         return super().to_diff_dict()
 
 
-def reload_and_populate_configs():
+def reload_schemas():
     """
     Automatically populates the registry for all PydanticClassRegistryMixin subclasses
     and reloads schemas for all Config classes to ensure their schemas are up-to-date
     with the current registry state.
     """
-    TokenProposalConfig.auto_populate_registry()
+    TokenProposalConfig.reload_schema()
     SpeculatorsConfig.reload_schema()
-    SpeculatorModelConfig.auto_populate_registry()
+    SpeculatorModelConfig.reload_schema()

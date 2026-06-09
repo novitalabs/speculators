@@ -133,6 +133,112 @@ class Qwen3DecoderEagle3FirstLayer(Eagle3FirstLayerMixin, Qwen3DecoderLayer):
         self._patch_eagle3_projections(config, Qwen3RMSNorm, norm_before_residual)
 
 
+# DeepSeek-V3 / Kimi-K2.5 Eagle3 first layer (MLA attention adaptation)
+try:
+    from speculators.models.base_components import (
+        DeepseekV3DecoderLayer as _DsDecoderLayer,
+        _BlockMaskCompatDecoder as _DsBlockMaskDecoder,
+        DeepseekV3RMSNorm as _DsRMSNorm,
+        DeepseekV3Config as _DsConfig,
+        _HAS_DEEPSEEK,
+    )
+
+    if _HAS_DEEPSEEK:
+        class DeepseekV3DecoderEagle3FirstLayer(Eagle3FirstLayerMixin, _DsBlockMaskDecoder):
+            """Eagle3 first layer for K2.5/DeepSeek-V3 with MLA attention.
+
+            MLA uses LoRA-style projections instead of standard q/k/v:
+            - q_a_proj [H -> q_lora_rank] + q_b_proj [q_lora_rank -> heads*dim]
+            - kv_a_proj_with_mqa [H -> kv_lora_rank+rope_dim] + kv_b_proj [...]
+
+            We patch q_a_proj and kv_a_proj_with_mqa to accept 2*H input,
+            leaving the b_proj (which generates actual Q/K/V) unchanged.
+            """
+            def __init__(
+                self,
+                config: _DsConfig,
+                layer_idx: int,
+                norm_before_residual: bool = False,
+            ):
+                # Use SDPA for memory-efficient attention (eager OOMs on long packed sequences)
+                config._attn_implementation = "sdpa"
+                super().__init__(config, layer_idx)
+                self._patch_eagle3_projections_mla(config, _DsRMSNorm, norm_before_residual)
+
+            def _patch_eagle3_projections_mla(self, config, norm_class, norm_before_residual):
+                """Patch MLA input projections to accept 2*hidden_size."""
+                self.norm_before_residual = norm_before_residual
+                self.hidden_norm = norm_class(
+                    config.hidden_size, eps=getattr(config, 'rms_norm_eps', 1e-5)
+                )
+                # MLA: patch LoRA input projections (a_proj) to accept 2*H
+                self.self_attn.q_a_proj = torch.nn.Linear(
+                    2 * config.hidden_size,
+                    config.q_lora_rank,
+                    bias=config.attention_bias,
+                )
+                self.self_attn.kv_a_proj_with_mqa = torch.nn.Linear(
+                    2 * config.hidden_size,
+                    config.kv_lora_rank + config.qk_rope_head_dim,
+                    bias=config.attention_bias,
+                )
+                # q_b_proj, kv_b_proj, kv_a_layernorm, q_a_layernorm: unchanged
+
+            def forward(self, hidden_states, attention_mask=None, position_ids=None,
+                        past_key_values=None, use_cache=False, cache_position=None,
+                        position_embeddings=None, **kwargs):
+                # Reject BlockMask — K2.5 requires dense 4D mask with document boundaries.
+                if attention_mask is not None and not isinstance(attention_mask, torch.Tensor):
+                    raise TypeError(
+                        f"Eagle3 K2.5 first layer received non-tensor attention_mask "
+                        f"(type={type(attention_mask).__name__}). Use build_packed_attention_mask()."
+                    )
+
+                # Reset cache_position: Eagle3 TTT uses arange(step*S, (step+1)*S)
+                # but K2.5 MLA interprets large values as kv_seq_len offset
+                if cache_position is not None:
+                    cache_position = torch.arange(
+                        hidden_states.shape[1], device=hidden_states.device
+                    )
+
+                # Eagle3 uses 1-indexed position_ids, but K2.5 rotary embedding
+                # returns cos[:seq_len] (0-indexed). Shift to 0-indexed to avoid OOB.
+                if position_ids is not None and position_ids.min() >= 1:
+                    position_ids = position_ids - 1
+
+                # Eagle3 first-layer logic (reimplemented to handle K2.5 MLA 3-tuple return)
+                mid = hidden_states.shape[2] // 2
+                embeds, hidden = hidden_states.split(mid, dim=-1)
+                residual = hidden
+                embeds = self.input_layernorm(embeds)
+                hidden = self.hidden_norm(hidden)
+                if self.norm_before_residual:
+                    residual = hidden
+                hidden_states = torch.cat([embeds, hidden], dim=-1)
+
+                # K2.5 attention returns (output, weights, past_kv) — 3 values
+                attn_result = self.self_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+                attn_output = attn_result[0] if isinstance(attn_result, tuple) else attn_result
+                hidden_states = residual + attn_output
+
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+                hidden_states = self.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+                return hidden_states
+except ImportError:
+    _HAS_DEEPSEEK = False
+
+
 model_classes: dict[str, base_components.ModelComponents] = {
     "llama": base_components.override_components(
         "llama", first_layer_class=LlamaDecoderEagle3FirstLayer
@@ -141,3 +247,11 @@ model_classes: dict[str, base_components.ModelComponents] = {
         "qwen3", first_layer_class=Qwen3DecoderEagle3FirstLayer
     ),
 }
+
+# Register kimi_k2 Eagle3 first layer if available
+if _HAS_DEEPSEEK:
+    _kimi_eagle3 = base_components.override_components(
+        "kimi_k2", first_layer_class=DeepseekV3DecoderEagle3FirstLayer
+    )
+    model_classes["kimi_k2"] = _kimi_eagle3
+    model_classes["deepseek_v3"] = _kimi_eagle3  # same config type from DeepseekV3Config

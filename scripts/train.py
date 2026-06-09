@@ -9,12 +9,19 @@ from transformers import LlamaConfig, PretrainedConfig
 from transformers.models.auto.configuration_auto import AutoConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
+# Import DeepseekV3Config for kimi_k2 architecture
+try:
+    from speculators.models.base_components import DeepseekV3Config, _HAS_DEEPSEEK
+except ImportError:
+    _HAS_DEEPSEEK = False
+
 from speculators.model import SpeculatorModel
 from speculators.train.data import (
     Eagle3SampleFileDataset,
     create_collate_fn,
     split_files,
     standardize_data_v1,
+    standardize_data_mtp,
 )
 from speculators.train.distributed_batch_sampler import (
     MultipackDistributedBatchSamplerV2,
@@ -28,6 +35,8 @@ DRAFT_ARCH_CONFIGS: dict[str, type] = {
     "llama": LlamaConfig,
     "qwen3": Qwen3Config,
 }
+if _HAS_DEEPSEEK:
+    DRAFT_ARCH_CONFIGS["kimi_k2"] = DeepseekV3Config
 
 
 def set_seed(seed: int, deterministic: bool = False):
@@ -71,7 +80,7 @@ def setup_dataloader(
     else:
         noise_transform = None
 
-    standardize_fn = standardize_data_v1
+    standardize_fn = standardize_data_mtp if args.speculator_type == "mtp" else standardize_data_v1
 
     dataset = Eagle3SampleFileDataset(
         file_list=file_list,
@@ -85,15 +94,18 @@ def setup_dataloader(
         num_replicas=world_size,
         rank=local_rank,
     )
-    return DataLoader(
-        dataset,
-        batch_sampler=batch_sampler,
-        num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
-        pin_memory=True,
-        collate_fn=create_collate_fn(args.total_seq_len),
-        persistent_workers=True,
-    )
+    dataloader_kwargs = {
+        "dataset": dataset,
+        "batch_sampler": batch_sampler,
+        "num_workers": num_workers,
+        "pin_memory": True,
+        "collate_fn": create_collate_fn(args.total_seq_len),
+    }
+    # prefetch_factor and persistent_workers only valid with num_workers > 0
+    if num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = prefetch_factor
+        dataloader_kwargs["persistent_workers"] = True
+    return DataLoader(**dataloader_kwargs)
 
 
 def create_transformer_layer_config(
@@ -114,13 +126,14 @@ def create_transformer_layer_config(
         )
 
     config_class = DRAFT_ARCH_CONFIGS[draft_arch]
-    verifier_config = AutoConfig.from_pretrained(verifier_name_or_path)
+    verifier_config = AutoConfig.from_pretrained(verifier_name_or_path, trust_remote_code=True)
 
     # For multimodal models (Qwen3VL, etc.), extract text_config
     if hasattr(verifier_config, "text_config"):
         verifier_config = verifier_config.text_config
 
-    transformer_layer_config = config_class(
+    # Common config params
+    config_kwargs = dict(
         vocab_size=verifier_config.vocab_size,
         hidden_size=verifier_config.hidden_size,
         intermediate_size=verifier_config.intermediate_size,
@@ -133,7 +146,24 @@ def create_transformer_layer_config(
         rms_norm_eps=verifier_config.rms_norm_eps,
         head_dim=getattr(verifier_config, "head_dim", None),
     )
-    transformer_layer_config._attn_implementation = "simple_flex_attention"  # noqa: SLF001
+    # For MLA-based architectures (kimi_k2/deepseek_v3), pass MLA-specific params
+    if draft_arch == "kimi_k2":
+        for key in [
+            "q_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim",
+            "v_head_dim", "kv_lora_rank", "rope_scaling", "rope_theta",
+            "n_routed_experts", "n_shared_experts", "num_experts_per_tok",
+            "moe_intermediate_size", "moe_layer_freq", "n_group",
+            "routed_scaling_factor", "norm_topk_prob", "scoring_func",
+            "topk_group", "topk_method", "first_k_dense_replace",
+        ]:
+            if hasattr(verifier_config, key):
+                config_kwargs[key] = getattr(verifier_config, key)
+    transformer_layer_config = config_class(**config_kwargs)
+    # kimi_k2 uses SDPA (eager OOMs on long packed sequences; MLA incompatible with flex_attention)
+    if draft_arch == "kimi_k2":
+        transformer_layer_config._attn_implementation = "sdpa"  # noqa: SLF001
+    else:
+        transformer_layer_config._attn_implementation = "simple_flex_attention"  # noqa: SLF001
     return transformer_layer_config
 
 
@@ -166,7 +196,7 @@ def main(args: argparse.Namespace):
         d2t = None
         t2d = None
         # When vocab mapping is not provided, use the full verifier vocab
-        verifier_config = AutoConfig.from_pretrained(args.verifier_name_or_path)
+        verifier_config = AutoConfig.from_pretrained(args.verifier_name_or_path, trust_remote_code=True)
         if hasattr(verifier_config, "text_config"):
             verifier_config = verifier_config.text_config
         draft_vocab_size = verifier_config.vocab_size
@@ -177,8 +207,6 @@ def main(args: argparse.Namespace):
     )
 
     # Get model class from registry and create model using its factory method
-    if SpeculatorModel.registry_auto_discovery:
-        SpeculatorModel.auto_populate_registry()
 
     if args.speculator_type not in SpeculatorModel.registry:
         raise ValueError(
@@ -195,26 +223,16 @@ def main(args: argparse.Namespace):
         **vars(args),
     )
 
-    # Setup dataloaders
-    train_files, val_files = split_files(args.data_path, ratio=0.9)
-    train_loader = setup_dataloader(
-        train_files,
-        world_size,
-        local_rank,
-        add_noise=True,
-        noise_std=args.noise_std,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-    )
-    val_loader = setup_dataloader(
-        val_files,
-        world_size,
-        local_rank,
-        add_noise=False,
-        noise_std=args.noise_std,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-    )
+    # Optionally initialize from pretrained weights (e.g. fine-tuning from NVIDIA Eagle3)
+    if args.pretrain_weights is not None:
+        import safetensors.torch as storch
+        from loguru import logger as _log
+        pretrain_sd = storch.load_file(args.pretrain_weights)
+        missing, unexpected = draft_model.load_state_dict(pretrain_sd, strict=False)
+        _log.info(
+            "Loaded pretrain weights from {}: {} loaded, {} missing, {} unexpected",
+            args.pretrain_weights, len(pretrain_sd) - len(missing), len(missing), len(unexpected),
+        )
 
     # Get trainer kwargs from model class
     train_call_kwargs, val_call_kwargs = model_class.get_trainer_kwargs(**vars(args))
@@ -228,12 +246,166 @@ def main(args: argparse.Namespace):
         local_rank=local_rank,
         train_call_kwargs=train_call_kwargs,
         val_call_kwargs=val_call_kwargs,
+        max_checkpoints=args.max_checkpoints,
         scheduler_type=args.scheduler_type,
         scheduler_warmup_steps=args.scheduler_warmup_steps,
         scheduler_total_steps=args.scheduler_total_steps,
         scheduler_num_cosine_cycles=args.scheduler_num_cosine_cycles,
     )
-    trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
+
+    if args.dynamic:
+        # ---- Dynamic hidden states training ----
+        assert not is_distributed, (
+            "Dynamic training only supports single-GPU "
+            "(vLLM uses TP for other GPUs). Do not use torchrun."
+        )
+        if not args.target_model_path:
+            raise ValueError("--target-model-path is required for --dynamic mode")
+        if not args.train_data_path:
+            raise ValueError("--train-data-path is required for --dynamic mode")
+
+        import logging
+        from datasets import load_from_disk
+        _dyn_log = logging.getLogger("speculators")
+
+        # 1. Load dataset: either pre-tokenized HF dataset or raw conversations
+        import os
+        if os.path.isdir(args.train_data_path) and os.path.exists(
+            os.path.join(args.train_data_path, "dataset_info.json")
+        ):
+            # Pre-tokenized HF dataset with input_ids + loss_mask columns
+            _dyn_log.info(
+                "Loading pre-tokenized HF dataset from %s ...", args.train_data_path
+            )
+            hf_dataset = load_from_disk(args.train_data_path)
+            _dyn_log.info("Dataset: %d samples", len(hf_dataset))
+        else:
+            # Raw conversation dataset — tokenize via preprocessing pipeline
+            from speculators.data_generation.preprocessing import load_and_preprocess_dataset
+            _dyn_log.info(
+                "Loading and preprocessing dataset from %s ...", args.train_data_path
+            )
+            hf_dataset, _tokenizer = load_and_preprocess_dataset(
+                target_model_path=args.target_model_path,
+                train_data_path=args.train_data_path,
+                seq_length=args.seq_length,
+                max_samples=None,
+                seed=args.seed,
+            )
+            _dyn_log.info("Dataset: %d samples", len(hf_dataset))
+
+        # Apply max-samples cap (subsample for manageable epoch length)
+        if args.max_samples > 0 and len(hf_dataset) > args.max_samples:
+            import random as _rng
+            _rng.seed(args.seed)
+            indices = _rng.sample(range(len(hf_dataset)), args.max_samples)
+            indices.sort()
+            hf_dataset = hf_dataset.select(indices)
+            _dyn_log.info("Subsampled to %d samples (--max-samples %d)", len(hf_dataset), args.max_samples)
+
+        # 2. Split into train/val
+        n_val = int(len(hf_dataset) * args.val_ratio)
+        n_train = len(hf_dataset) - n_val
+        train_hf = hf_dataset.select(range(n_train))
+        val_hf = hf_dataset.select(range(n_train, len(hf_dataset)))
+        _dyn_log.info("Split: %d train, %d val", len(train_hf), len(val_hf))
+
+        # 3. Create lightweight dataloaders
+        from speculators.train.data import (
+            DynamicEagle3Dataset,
+            create_dynamic_collate_fn,
+        )
+
+        train_ds = DynamicEagle3Dataset(train_hf, args.total_seq_len)
+        val_ds = DynamicEagle3Dataset(val_hf, args.total_seq_len)
+
+        train_sampler = MultipackDistributedBatchSamplerV2(
+            batch_max_length=args.total_seq_len,
+            lengths=train_ds.approx_lengths,
+            num_replicas=1,
+            rank=0,
+        )
+        val_sampler = MultipackDistributedBatchSamplerV2(
+            batch_max_length=args.total_seq_len,
+            lengths=val_ds.approx_lengths,
+            num_replicas=1,
+            rank=0,
+        )
+
+        dynamic_collate = create_dynamic_collate_fn(args.total_seq_len)
+        # num_workers=0: vLLM CUDA context lives in main process
+        train_loader = DataLoader(
+            train_ds, batch_sampler=train_sampler,
+            collate_fn=dynamic_collate, num_workers=0,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_sampler=val_sampler,
+            collate_fn=dynamic_collate, num_workers=0,
+        )
+
+        # 4. Initialize VllmHiddenStatesGenerator
+        from speculators.data_generation.vllm_hidden_states_generator import (
+            VllmHiddenStatesGenerator,
+        )
+        _dyn_log.info(
+            "Initializing VllmHiddenStatesGenerator (TP=%d, gpu_mem=%.1f%%) ...",
+            args.tensor_parallel_size, args.gpu_memory_utilization * 100,
+        )
+        generator = VllmHiddenStatesGenerator(
+            model_path=args.target_model_path,
+            layer_ids=args.layer_ids,
+            max_model_len=args.seq_length,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            tensor_parallel_size=args.tensor_parallel_size,
+            enforce_eager=args.enforce_eager,
+        )
+        _dyn_log.info("VllmHiddenStatesGenerator ready")
+
+        # 5. Setup noise transform
+        noise_transform = AddUniformNoise(
+            std=args.noise_std,
+            tensors=("hidden_states", "verifier_last_hidden_states"),
+        ) if args.noise_std > 0 else None
+
+        # 6. Create DynamicTrainer
+        from speculators.train.dynamic_trainer import DynamicTrainer
+
+        standardize_fn = standardize_data_mtp if args.speculator_type == "mtp" else standardize_data_v1
+
+        trainer = DynamicTrainer(
+            model=draft_model,
+            config=trainer_config,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            generator=generator,
+            noise_transform=noise_transform,
+            standardize_fn=standardize_fn,
+            max_len=args.total_seq_len,
+            epoch_samples=args.epoch_samples,
+            val_epoch_samples=args.val_epoch_samples,
+        )
+    else:
+        # ---- Offline training (existing path) ----
+        train_files, val_files = split_files(args.data_path, ratio=0.9)
+        train_loader = setup_dataloader(
+            train_files,
+            world_size,
+            local_rank,
+            add_noise=True,
+            noise_std=args.noise_std,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+        )
+        val_loader = setup_dataloader(
+            val_files,
+            world_size,
+            local_rank,
+            add_noise=False,
+            noise_std=args.noise_std,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+        )
+        trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
     # Run training
     trainer.run_training()
@@ -253,6 +425,8 @@ def parse_args():
     )
     parser.add_argument("--data-path", type=str, default="./data")
     parser.add_argument("--save-path", type=str, default="./checkpoints")
+    parser.add_argument("--max-checkpoints", type=int, default=None,
+                        help="Keep only the N most recent checkpoints; delete older ones. Default: keep all.")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--no-resume-from-checkpoint", action="store_true")
@@ -324,6 +498,65 @@ def parse_args():
     parser.add_argument("--scheduler-warmup-steps", type=int, default=None)
     parser.add_argument("--scheduler-total-steps", type=int, default=None)
     parser.add_argument("--scheduler-num-cosine-cycles", type=float, default=0.5)
+    parser.add_argument("--loss-type", type=str, default="ce", choices=["ce", "kl"])
+    parser.add_argument(
+        "--pretrain-weights", type=str, default=None,
+        help="Path to a pretrained model.safetensors file to initialize weights from "
+             "(e.g. for fine-tuning from NVIDIA Eagle3 checkpoint). "
+             "Applied after model construction, before training starts.",
+    )
+
+    # Dynamic hidden states training arguments
+    parser.add_argument(
+        "--dynamic", action="store_true",
+        help="Enable dynamic hidden states generation during training. "
+             "Generates hidden states on-the-fly via VllmHiddenStatesGenerator "
+             "instead of loading pre-extracted .pt files. Requires single-GPU "
+             "(vLLM uses TP for other GPUs).",
+    )
+    parser.add_argument(
+        "--target-model-path", type=str, default=None,
+        help="[dynamic] Path to verifier model for vLLM hidden states generation",
+    )
+    parser.add_argument(
+        "--train-data-path", type=str, default=None,
+        help="[dynamic] HF dataset name or path for training data (e.g., 'sharegpt')",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization", type=float, default=0.3,
+        help="[dynamic] vLLM GPU memory fraction (default: 0.3)",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size", type=int, default=8,
+        help="[dynamic] TP size for vLLM (default: 8)",
+    )
+    parser.add_argument(
+        "--layer-ids", type=int, nargs="+", default=None,
+        help="[dynamic] Layer IDs for hidden states capture (default: auto)",
+    )
+    parser.add_argument(
+        "--seq-length", type=int, default=2048,
+        help="[dynamic] Max sequence length for vLLM (default: 2048)",
+    )
+    parser.add_argument(
+        "--val-ratio", type=float, default=0.1,
+        help="[dynamic] Fraction of dataset to use for validation (default: 0.1)",
+    )
+    parser.add_argument(
+        "--max-samples", type=int, default=0,
+        help="[dynamic] Max training+val samples to use (0=all). Useful to cap epoch length.",
+    )
+    parser.add_argument(
+        "--epoch-samples", type=int, default=0,
+        help="[dynamic] Max training samples per epoch (0=full dataset). Cycles through all data.",
+    )
+    parser.add_argument(
+        "--enforce-eager", action="store_true", default=False,
+        help="[dynamic] Force eager mode for vLLM (disable CUDA graphs/compile). "
+             "Default: False (use compiled mode for better performance and "
+             "consistency with production inference).",
+    )
+
     return parser.parse_args()
 
 
