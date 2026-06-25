@@ -260,11 +260,28 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
         # __pydantic_extra__[name] = value and would fail on None.
         object.__setattr__(instance, '__pydantic_extra__', {})
         object.__setattr__(instance, '__pydantic_private__', None)
+        object.__setattr__(
+            instance,
+            "_attn_implementation_internal",
+            cls._normalize_attn_implementation(kwargs.get("attn_implementation")),
+        )
         return instance
 
     def __init__(self, **kwargs):
         # now safe to call BaseModel.__init__ with __pydantic_fields_set__ already present
         BaseModel.__init__(self, **kwargs)
+
+    @staticmethod
+    def _normalize_attn_implementation(value: Any) -> Any:
+        """Match transformers' root config behavior for attn_implementation dicts."""
+        if isinstance(value, dict):
+            return value.get("")
+        return value
+
+    def _ensure_pretrained_runtime_fields(self) -> None:
+        if not hasattr(self, "_attn_implementation_internal"):
+            object.__setattr__(self, "_attn_implementation_internal", None)
+        object.__setattr__(self, "transformers_version", version("transformers"))
 
     def model_post_init(self, __context) -> None:
         # Runs for every subclass after validation (Pydantic calls it even when a
@@ -294,7 +311,7 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
                 self.__pydantic_fields_set__.add(name)
 
         # manually set PretrainedConfig attributes
-        object.__setattr__(self, 'transformers_version', version("transformers"))
+        self._ensure_pretrained_runtime_fields()
 
     def validate(self) -> None:
         """transformers PretrainedConfig.validate() hook.
@@ -335,6 +352,7 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
                     default = None
                 object.__setattr__(self, name, default)
                 self.__pydantic_fields_set__.add(name)
+        self._ensure_pretrained_runtime_fields()
 
     def to_dict(self) -> dict[str, Any]:
         """

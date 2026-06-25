@@ -8,6 +8,7 @@ import torch
 from transformers import AutoConfig, AutoTokenizer
 from vllm.config import (
     CacheConfig,
+    CompilationConfig,
     DeviceConfig,
     LoadConfig,
     ModelConfig,
@@ -84,18 +85,44 @@ class VllmHiddenStatesGenerator:
         tensor_parallel_size: int = 1,
         max_num_batched_tokens: int | None = None,
         enforce_eager: bool = True,
+        trust_remote_code: bool = True,
+        max_prompt_len: int | None = None,
+        model_loader_extra_config: dict | None = None,
+        compilation_config: dict | None = None,
     ):
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
         self.enforce_eager = enforce_eager
+        self.trust_remote_code = trust_remote_code
         self._request_counter = 0
+        if max_prompt_len is None:
+            self.max_prompt_len = max(1, max_model_len - MAX_DECODE_TOKENS)
+            engine_max_model_len = max_model_len
+        else:
+            self.max_prompt_len = int(max_prompt_len)
+            engine_max_model_len = max(
+                int(max_model_len),
+                self.max_prompt_len + MAX_DECODE_TOKENS,
+            )
 
         log.info(f"Initializing hidden states generator for {model_path}")
         log.info(f"Tensor parallel size: {tensor_parallel_size}")
+        if engine_max_model_len != max_model_len:
+            log.info(
+                f"Using vLLM engine max_model_len={engine_max_model_len} "
+                f"to capture prompt_len={self.max_prompt_len} "
+                f"with max_tokens={MAX_DECODE_TOKENS}"
+            )
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+        )
 
-        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+        )
         if hasattr(config, "num_hidden_layers"):
             num_layers = config.num_hidden_layers
         elif hasattr(config, "text_config"):
@@ -123,11 +150,14 @@ class VllmHiddenStatesGenerator:
 
         self.vllm_config = self._create_vllm_config(
             model_path=model_path,
-            max_model_len=max_model_len,
+            max_model_len=engine_max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
             tensor_parallel_size=tensor_parallel_size,
             max_num_batched_tokens=max_num_batched_tokens,
             enforce_eager=enforce_eager,
+            trust_remote_code=trust_remote_code,
+            model_loader_extra_config=model_loader_extra_config,
+            compilation_config=compilation_config,
         )
 
         log.info("Initializing executor...")
@@ -189,6 +219,9 @@ class VllmHiddenStatesGenerator:
         tensor_parallel_size: int,
         max_num_batched_tokens: int | None = None,
         enforce_eager: bool = True,
+        trust_remote_code: bool = True,
+        model_loader_extra_config: dict | None = None,
+        compilation_config: dict | None = None,
     ) -> VllmConfig:
         """Create VllmConfig with hidden states worker extension"""
         cache_config = CacheConfig(
@@ -205,12 +238,18 @@ class VllmHiddenStatesGenerator:
         max_num_seqs = MAX_NUM_SEQS
         if not max_num_batched_tokens:
             max_num_batched_tokens = max(MIN_MAX_BATCHED_TOKENS, max_model_len)
+        else:
+            max_num_batched_tokens = max(int(max_num_batched_tokens), max_model_len)
+
+        kwargs = {}
+        if compilation_config:
+            kwargs["compilation_config"] = CompilationConfig(**compilation_config)
 
         return VllmConfig(
             model_config=ModelConfig(
                 model=model_path,
                 tokenizer=model_path,
-                trust_remote_code=True,
+                trust_remote_code=trust_remote_code,
                 dtype="auto",
                 max_model_len=max_model_len,
                 enforce_eager=enforce_eager,
@@ -228,7 +267,10 @@ class VllmHiddenStatesGenerator:
                 is_encoder_decoder=False,
             ),
             device_config=DeviceConfig(device="cuda"),
-            load_config=LoadConfig(),
+            load_config=LoadConfig(
+                model_loader_extra_config=model_loader_extra_config or {}
+            ),
+            **kwargs,
         )
 
     def _setup_capture(self):
@@ -254,10 +296,10 @@ class VllmHiddenStatesGenerator:
             input_ids_list = token_ids
 
         log.debug(f"Generating hidden states for {len(input_ids_list)} sequences")
-        # Account for max_tokens=1 in sampling params
-        # (vLLM enforces: len(prompt) + max_tokens <= max_model_len)
-        max_len = self.vllm_config.model_config.max_model_len - MAX_DECODE_TOKENS
-        input_ids_list = [ids[:max_len] for ids in input_ids_list]
+        # Account for max_tokens=1 in sampling params. When max_prompt_len was
+        # explicitly supplied, the engine length has already been bumped by one
+        # so strict 20k prompts are not silently truncated to 19999.
+        input_ids_list = [ids[: self.max_prompt_len] for ids in input_ids_list]
 
         # Track request IDs and prompt lengths for proper token attribution
         request_id_to_idx = {}
@@ -321,6 +363,8 @@ class VllmHiddenStatesGenerator:
                 )
 
             model_output = self.executor.execute_model(scheduler_output)
+            if prefill_metadata:
+                self.executor.collective_rpc("_store_last_aux_hidden_states")
             self.executor.sample_tokens(model_output)
 
         # Abort all requests (prefill complete, don't need decode)
@@ -335,7 +379,11 @@ class VllmHiddenStatesGenerator:
         )
 
         if not request_states_dict:
-            raise RuntimeError("Failed to capture hidden states from worker")
+            capture_debug = self.executor.collective_rpc("_get_capture_debug_state")
+            raise RuntimeError(
+                "Failed to capture hidden states from worker. "
+                f"capture_debug={capture_debug}"
+            )
 
         log.debug(f"Captured states for {len(request_states_dict)} requests")
 
