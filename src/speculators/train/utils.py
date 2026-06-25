@@ -71,6 +71,9 @@ def apply_fully_sharded(model: torch.nn.Module):
         layer.to_empty(device="meta")
         fully_shard(layer, mp_policy=mp_policy)
 
-    fully_shard(model)
+    # Keep root-owned modules such as fc/lm_head/verifier_lm_head in the same
+    # mixed-precision policy as the decoder layers. Without this, long-context
+    # Eagle3 loss allocates full-vocab logits in fp32.
+    fully_shard(model, mp_policy=mp_policy)
 
     return model
