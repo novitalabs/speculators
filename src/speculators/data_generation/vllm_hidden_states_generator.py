@@ -535,6 +535,12 @@ class VllmHiddenStatesGenerator:
 
     def __del__(self):
         if hasattr(self, "executor"):
+            # Drain any in-flight in-worker async puts (CAMELOT_WORKER_ASYNC_PUT_DEPTH)
+            # so queued ::hidden_states writes complete before the workers exit.
+            try:
+                self.executor.collective_rpc("_flush_mooncake_puts")
+            except Exception:
+                log.warning("Exception during in-worker Mooncake put flush")
             try:
                 self.executor.shutdown()
             except Exception:

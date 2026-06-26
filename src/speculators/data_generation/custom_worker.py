@@ -2,8 +2,10 @@
 
 import inspect
 import logging
+import os
 import types
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from itertools import islice
 from typing import Any
 
@@ -436,6 +438,7 @@ class HiddenStatesWorkerExtension:
         }
 
         store = self._ensure_mooncake_store()
+        depth = self._async_put_depth()
         result: dict[str, dict] = {}
         for req_id, base_key in req_id_to_key.items():
             layers = per_request.get(req_id)
@@ -445,12 +448,99 @@ class HiddenStatesWorkerExtension:
             # (n_layers, seq, H), contiguous, on CPU.
             hs = torch.stack([h.contiguous().to("cpu") for h in layers], dim=0)
             subkey = f"{base_key}::hidden_states"
-            result[req_id] = store.put_raw_tensor(subkey, hs)
+            if depth <= 1:
+                # Synchronous path (default): the RDMA put runs inline and the
+                # returned descriptor is the store's own.
+                result[req_id] = store.put_raw_tensor(subkey, hs)
+            else:
+                # Async path: the stage-memcpy + RDMA put overlaps the next
+                # generate() prefill on a single background thread. The
+                # descriptor is fully known from the CPU tensor before the put,
+                # so it is returned now; the put is reaped on a later call.
+                meta = {
+                    "field": "hidden_states",
+                    "shape": list(hs.shape),
+                    "dtype": str(hs.dtype),
+                    "nbytes": int(hs.numel() * hs.element_size()),
+                }
+                self._submit_async_put(store, subkey, hs, depth)
+                result[req_id] = meta
 
         # Clear intermediate storage (same as _get_captured_states).
         self._captured_states = None  # type: ignore[assignment]
         self._request_metadata = []  # type: ignore[assignment]
         return result
+
+    def _async_put_depth(self) -> int:
+        """In-flight depth for the background put queue.
+
+        ``CAMELOT_WORKER_ASYNC_PUT_DEPTH`` <= 1 (default) keeps the fully
+        synchronous put path. >= 2 overlaps the stage+RDMA put with the next
+        prefill and bounds in-flight host buffers to the configured depth.
+        """
+        try:
+            return int(os.environ.get("CAMELOT_WORKER_ASYNC_PUT_DEPTH", "1"))
+        except (TypeError, ValueError):
+            return 1
+
+    def _submit_async_put(self, store, subkey: str, hs: "torch.Tensor", depth: int) -> None:
+        """Enqueue one ``put_raw_tensor`` on the background writer thread.
+
+        Reaps already-finished puts first (surfacing any failure as a deferred
+        fail-fast), then applies backpressure: if the in-flight queue is at
+        ``depth``, block on the oldest future before submitting the new put so
+        the worker can never outrun the writer / RDMA segment unboundedly.
+        """
+        if getattr(self, "_put_executor", None) is None:
+            self._put_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="mooncake-put"
+            )
+            self._inflight_puts: list[tuple[Future, str]] = []
+        self._reap_inflight_puts(block=False)
+        while len(self._inflight_puts) >= depth:
+            oldest_fut, oldest_key = self._inflight_puts.pop(0)
+            oldest_fut.result()  # block + surface failure (backpressure)
+        fut = self._put_executor.submit(store.put_raw_tensor, subkey, hs)
+        self._inflight_puts.append((fut, subkey))
+
+    def _reap_inflight_puts(self, *, block: bool) -> None:
+        """Drain finished background puts; raise if any failed.
+
+        When ``block`` is False, only completed futures are removed (others stay
+        in flight). When True, waits for every in-flight put — the teardown
+        barrier so no ``::hidden_states`` write is lost on shutdown.
+        ``Future.result()`` re-raises the put exception in this (worker RPC)
+        thread, so a failed background put becomes a deferred fail-fast.
+        """
+        inflight = getattr(self, "_inflight_puts", None)
+        if not inflight:
+            return
+        if block:
+            pending = inflight
+            self._inflight_puts = []
+            for fut, _key in pending:
+                fut.result()
+            return
+        still: list[tuple[Future, str]] = []
+        for fut, key in inflight:
+            if fut.done():
+                fut.result()  # surface failure
+            else:
+                still.append((fut, key))
+        self._inflight_puts = still
+
+    def _flush_mooncake_puts(self) -> bool:
+        """RPC entry point: block until all in-flight background puts finish.
+
+        Called from the generator on engine teardown so queued ``::hidden_states``
+        writes complete before the worker process exits. Returns True on the
+        capture rank, False elsewhere (no-op).
+        """
+        if not _is_capture_rank():
+            return False
+        self._reap_inflight_puts(block=True)
+        return True
+
 
     def _ensure_mooncake_store(self):
         """Lazy-init a writer-side MooncakeBlobStore on the worker (once).
