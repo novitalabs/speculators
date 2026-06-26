@@ -394,6 +394,99 @@ class HiddenStatesWorkerExtension:
         self._request_metadata = []  # type: ignore[assignment]
         return result
 
+    def _store_captured_states_to_mooncake(
+        self, req_id_to_key: dict[str, str]
+    ) -> dict[str, dict]:
+        """Write captured hidden states to Mooncake from inside the worker.
+
+        In-worker write path (CAMELOT_INWORKER_HS_WRITE): instead of returning the
+        ~1.1 GB-per-sample hidden_states tensors to the rank-0 Python driver over a
+        collective_rpc (the 65.8%-of-generate transport gap), each request's stacked
+        ``(n_layers, seq, H)`` tensor is written here to ``{base_key}::hidden_states``
+        and only a KB-scale descriptor dict ``{req_id: hs_meta}`` is returned. The
+        descriptor matches one element of MooncakeBlobStore's base ``_tensors`` list,
+        so the driver injects it into the metadata it writes and the trainer hydrates
+        all three fields byte-safely. Mirrors TorchSpec's sgl_engine in-worker write.
+
+        Only the TP capture rank holds states, so only it writes. Returns ``{}`` on a
+        non-capture rank or when nothing was captured.
+        """
+        if not _is_capture_rank() or self._captured_states is None:
+            return {}
+
+        # Reuse the concat-across-iterations + slice-by-request logic from
+        # _get_captured_states so the stored tensors are byte-identical to the
+        # driver-transport path.
+        concatenated_layers = [
+            torch.cat(layer_tensors, dim=0) for layer_tensors in self._captured_states
+        ]
+        request_chunks: defaultdict[str, list[list[torch.Tensor]]] = defaultdict(
+            lambda: [[] for _ in range(len(concatenated_layers))]
+        )
+        current_idx = 0
+        for metadata in self._request_metadata:  # type: ignore[has-type]
+            for req_id, num_tok in metadata:
+                for layer_idx, layer_tensor in enumerate(concatenated_layers):
+                    chunk = layer_tensor[current_idx : current_idx + num_tok].clone()
+                    request_chunks[req_id][layer_idx].append(chunk)
+                current_idx += num_tok
+        per_request: dict[str, list[torch.Tensor]] = {
+            req_id: [torch.cat(chunks, dim=0) for chunks in layer_chunks]
+            for req_id, layer_chunks in request_chunks.items()
+        }
+
+        store = self._ensure_mooncake_store()
+        result: dict[str, dict] = {}
+        for req_id, base_key in req_id_to_key.items():
+            layers = per_request.get(req_id)
+            if not layers:
+                continue
+            # Match CamelotSample.from_emitter_dict: stack layers on dim 0 ->
+            # (n_layers, seq, H), contiguous, on CPU.
+            hs = torch.stack([h.contiguous().to("cpu") for h in layers], dim=0)
+            subkey = f"{base_key}::hidden_states"
+            result[req_id] = store.put_raw_tensor(subkey, hs)
+
+        # Clear intermediate storage (same as _get_captured_states).
+        self._captured_states = None  # type: ignore[assignment]
+        self._request_metadata = []  # type: ignore[assignment]
+        return result
+
+    def _ensure_mooncake_store(self):
+        """Lazy-init a writer-side MooncakeBlobStore on the worker (once).
+
+        Imports are deferred so the worker module stays importable in
+        environments without camelot/mooncake on the path. The worker registers a
+        larger writer segment than the driver (it now holds the in-flight ~1.1 GB
+        hidden_states objects); both sizes are env-overridable so the two clients
+        on the producer host don't double-book host memory.
+        """
+        store = getattr(self, "_mooncake_store", None)
+        if store is not None:
+            return store
+        import os
+
+        from camelot.framework.databus.mooncake_blob import (
+            MooncakeBlobStore,
+            MooncakeBlobStoreCfg,
+        )
+
+        cfg = MooncakeBlobStoreCfg.from_env()
+        seg = os.environ.get("CAMELOT_WORKER_MOONCAKE_GLOBAL_SEGMENT_BYTES")
+        if seg:
+            cfg.global_segment_size = int(seg)
+        buf = os.environ.get("CAMELOT_WORKER_MOONCAKE_LOCAL_BUFFER_BYTES")
+        cfg.local_buffer_size = int(buf) if buf else 256 << 20
+        store = MooncakeBlobStore(cfg)
+        store.setup()
+        self._mooncake_store = store
+        logger.info(
+            "in-worker Mooncake store ready: global_segment_size=%d local_buffer_size=%d",
+            cfg.global_segment_size,
+            cfg.local_buffer_size,
+        )
+        return store
+
     def _get_capture_debug_state(self) -> dict[str, Any]:
         captured_layers = getattr(self, "_captured_states", None)
         try:

@@ -1,5 +1,6 @@
 """Extract hidden states from intermediate layers during prefill using vLLM."""
 import os
+import time
 # vLLM defaults to fork in library mode, which breaks CUDA re-init for TP>1.
 # Must be set before any vLLM import/initialization.
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
@@ -37,13 +38,24 @@ from .logging_utils import PipelineLogger
 __all__ = ["VllmHiddenStatesGenerator"]
 
 # Constants
-CACHE_MEMORY_FRACTION = 0.2  # Fraction of GPU memory for KV cache
+# Fraction of (free-after-weights × gpu_memory_utilization) memory given to the
+# KV cache. Env-overridable: with gpu_memory_utilization=0.60 the effective KV
+# pool = 0.60 × CACHE_MEMORY_FRACTION of free-after-weights memory. Default 0.2
+# (→0.12) is conservative for serial prefill; raise toward 1.0 to match
+# TorchSpec sglang's ~0.6 KV pool when batching concurrent prefill.
+CACHE_MEMORY_FRACTION = float(os.environ.get("CAMELOT_KV_CACHE_MEMORY_FRACTION", "0.2"))
 VLLM_BLOCK_SIZE = 128 if is_npu_available() else 16  # Block size for KV cache
 MAX_NUM_SEQS = 32  # Maximum sequences for prefill-only workload
 MIN_MAX_BATCHED_TOKENS = 8192  # Minimum batched tokens threshold
 MAX_DECODE_TOKENS = 1  # Maximum tokens to generate (prefill only)
 SAMPLING_TEMPERATURE = 0.0  # Temperature for sampling (greedy)
 INITIAL_ARRIVAL_TIME = 0.0  # Initial request arrival time
+# Per-phase timing of generate() to isolate where wall time goes (engine-gap
+# diagnosis). Off by default; set CAMELOT_PROFILE_GENERATE=1 to emit one INFO
+# line per call decomposing add_request / schedule-loop (split into execute_model
+# vs the _store_last_aux_hidden_states capture RPC) / get_captured_states /
+# clone-cpu / empty_cache.
+PROFILE_GENERATE = os.environ.get("CAMELOT_PROFILE_GENERATE", "0") == "1"
 
 log = PipelineLogger(__name__)
 
@@ -279,14 +291,28 @@ class VllmHiddenStatesGenerator:
             args=(self.layer_ids,),
         )
 
-    def generate(self, token_ids: list[list[int]] | torch.Tensor) -> list[dict]:  # noqa: PLR0912, PLR0915
+    def generate(  # noqa: PLR0912, PLR0915
+        self,
+        token_ids: list[list[int]] | torch.Tensor,
+        *,
+        base_keys: list[str] | None = None,
+    ) -> list[dict]:
         """Extract hidden states from prefill phase only.
 
         Args:
             token_ids: Batch of token ID sequences as list[list[int]] or Tensor
+            base_keys: When provided (in-worker Mooncake write path,
+                CAMELOT_INWORKER_HS_WRITE), one base blob key per input sequence.
+                The captured hidden_states are written to ``{base_key}::hidden_states``
+                from inside the worker and only a KB-scale descriptor is returned,
+                avoiding the ~1.1 GB worker->driver transport. The returned dicts
+                then carry ``hs_meta`` + ``base_key`` and ``hidden_states=None``
+                instead of materialized tensors.
 
         Returns:
             List of dicts with keys: input_ids, hidden_states, loss_mask
+            (driver-transport path), or input_ids, hidden_states(None), hs_meta,
+            base_key, loss_mask (in-worker path).
         """
         if isinstance(token_ids, torch.Tensor):
             input_ids_list = token_ids.tolist()
@@ -294,6 +320,11 @@ class VllmHiddenStatesGenerator:
             if not token_ids:
                 raise ValueError("token_ids cannot be empty")
             input_ids_list = token_ids
+
+        if base_keys is not None and len(base_keys) != len(input_ids_list):
+            raise ValueError(
+                f"base_keys length {len(base_keys)} != token_ids length {len(input_ids_list)}"
+            )
 
         log.debug(f"Generating hidden states for {len(input_ids_list)} sequences")
         # Account for max_tokens=1 in sampling params. When max_prompt_len was
@@ -305,6 +336,7 @@ class VllmHiddenStatesGenerator:
         request_id_to_idx = {}
         request_id_to_prompt_len = {}
 
+        _t_add = time.monotonic() if PROFILE_GENERATE else 0.0
         for i, ids in enumerate(input_ids_list):
             # Ensure ids is a list (not tensor) for vLLM Request
             ids_list = ids.tolist() if isinstance(ids, torch.Tensor) else ids
@@ -329,11 +361,16 @@ class VllmHiddenStatesGenerator:
         # (prevents KV cache corruption with delayed block freeing)
         self._request_counter += 1
         self.executor.collective_rpc("_reset_capture")
+        _dt_add = (time.monotonic() - _t_add) if PROFILE_GENERATE else 0.0
 
         # Track progress for each request to distinguish prefill from decode
         request_num_computed = dict.fromkeys(request_id_to_idx, 0)
         schedule_iterations = 0
         all_prefill_complete = False
+        _dt_exec = 0.0  # cumulative execute_model (GPU prefill)
+        _dt_caprpc = 0.0  # cumulative _store_last_aux_hidden_states collective_rpc
+        _dt_sched = 0.0  # cumulative scheduler.schedule() + sample_tokens + metadata
+        _t_loop = time.monotonic() if PROFILE_GENERATE else 0.0
 
         while (
             scheduler_output := self.scheduler.schedule()
@@ -362,21 +399,89 @@ class VllmHiddenStatesGenerator:
                     "_set_request_metadata", args=(prefill_metadata,)
                 )
 
+            _t0 = time.monotonic() if PROFILE_GENERATE else 0.0
             model_output = self.executor.execute_model(scheduler_output)
+            if PROFILE_GENERATE:
+                _dt_exec += time.monotonic() - _t0
             if prefill_metadata:
+                _t1 = time.monotonic() if PROFILE_GENERATE else 0.0
                 self.executor.collective_rpc("_store_last_aux_hidden_states")
+                if PROFILE_GENERATE:
+                    _dt_caprpc += time.monotonic() - _t1
             self.executor.sample_tokens(model_output)
+        if PROFILE_GENERATE:
+            _dt_loop = time.monotonic() - _t_loop
+            _dt_sched = _dt_loop - _dt_exec - _dt_caprpc
 
         # Abort all requests (prefill complete, don't need decode)
         self.scheduler.finish_requests(
             list(request_id_to_idx.keys()), RequestStatus.FINISHED_ABORTED
         )
 
+        if base_keys is not None:
+            # In-worker Mooncake write: the worker stores each request's
+            # hidden_states under {base_key}::hidden_states and returns only a
+            # KB-scale descriptor. No 1.1 GB tensor crosses the RPC boundary and
+            # the driver-side clone().cpu() loop is skipped entirely.
+            req_id_to_key = {
+                req_id: base_keys[idx] for req_id, idx in request_id_to_idx.items()
+            }
+            _t_cap = time.monotonic() if PROFILE_GENERATE else 0.0
+            hs_meta_by_req = self.executor.collective_rpc(
+                "_store_captured_states_to_mooncake",
+                args=(req_id_to_key,),
+                unique_reply_rank=0,
+            )
+            _dt_cap = (time.monotonic() - _t_cap) if PROFILE_GENERATE else 0.0
+            if not hs_meta_by_req:
+                capture_debug = self.executor.collective_rpc("_get_capture_debug_state")
+                raise RuntimeError(
+                    "Failed to write hidden states from worker to Mooncake. "
+                    f"capture_debug={capture_debug}"
+                )
+            _t_clone = time.monotonic() if PROFILE_GENERATE else 0.0
+            results = []
+            for req_id in sorted(request_id_to_idx.keys(), key=lambda k: request_id_to_idx[k]):
+                i = request_id_to_idx[req_id]
+                if req_id not in hs_meta_by_req:
+                    raise RuntimeError(
+                        f"Request {req_id} not found in worker hs_meta. "
+                        f"Available: {list(hs_meta_by_req.keys())}"
+                    )
+                results.append(
+                    {
+                        "input_ids": torch.as_tensor(input_ids_list[i], dtype=torch.long),
+                        "hidden_states": None,
+                        "hs_meta": hs_meta_by_req[req_id],
+                        "base_key": base_keys[i],
+                        "loss_mask": None,
+                    }
+                )
+            _dt_clone = (time.monotonic() - _t_clone) if PROFILE_GENERATE else 0.0
+            _t_ec = time.monotonic() if PROFILE_GENERATE else 0.0
+            empty_cache()
+            if PROFILE_GENERATE:
+                _dt_ec = time.monotonic() - _t_ec
+                _total = _dt_add + _dt_loop + _dt_cap + _dt_clone + _dt_ec
+                log.info(
+                    "PROFILE generate[inworker]: total=%.3fs n=%d iters=%d | add=%.3f "
+                    "loop=%.3f (exec=%.3f cap_rpc=%.3f sched=%.3f) write_rpc=%.3f "
+                    "build=%.3f empty_cache=%.3f"
+                    % (
+                        _total, len(input_ids_list), schedule_iterations,
+                        _dt_add, _dt_loop, _dt_exec, _dt_caprpc, _dt_sched,
+                        _dt_cap, _dt_clone, _dt_ec,
+                    )
+                )
+            return results
+
         # Get captured states organized by request ID
+        _t_cap = time.monotonic() if PROFILE_GENERATE else 0.0
         request_states_dict = self.executor.collective_rpc(
             "_get_captured_states",
             unique_reply_rank=0,
         )
+        _dt_cap = (time.monotonic() - _t_cap) if PROFILE_GENERATE else 0.0
 
         if not request_states_dict:
             capture_debug = self.executor.collective_rpc("_get_capture_debug_state")
@@ -388,6 +493,7 @@ class VllmHiddenStatesGenerator:
         log.debug(f"Captured states for {len(request_states_dict)} requests")
 
         # Map results back to original input order
+        _t_clone = time.monotonic() if PROFILE_GENERATE else 0.0
         results = []
         for req_id in sorted(request_id_to_idx.keys(), key=lambda k: request_id_to_idx[k]):
             i = request_id_to_idx[req_id]
@@ -408,8 +514,23 @@ class VllmHiddenStatesGenerator:
                     "loss_mask": None,
                 }
             )
+        _dt_clone = (time.monotonic() - _t_clone) if PROFILE_GENERATE else 0.0
 
+        _t_ec = time.monotonic() if PROFILE_GENERATE else 0.0
         empty_cache()
+        if PROFILE_GENERATE:
+            _dt_ec = time.monotonic() - _t_ec
+            _total = _dt_add + _dt_loop + _dt_cap + _dt_clone + _dt_ec
+            log.info(
+                "PROFILE generate: total=%.3fs n=%d iters=%d | add=%.3f loop=%.3f "
+                "(exec=%.3f cap_rpc=%.3f sched=%.3f) get_states=%.3f clone_cpu=%.3f "
+                "empty_cache=%.3f"
+                % (
+                    _total, len(input_ids_list), schedule_iterations,
+                    _dt_add, _dt_loop, _dt_exec, _dt_caprpc, _dt_sched,
+                    _dt_cap, _dt_clone, _dt_ec,
+                )
+            )
         return results
 
     def __del__(self):
