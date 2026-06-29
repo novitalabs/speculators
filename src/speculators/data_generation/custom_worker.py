@@ -439,15 +439,31 @@ class HiddenStatesWorkerExtension:
 
         store = self._ensure_mooncake_store()
         depth = self._async_put_depth()
+        single_copy = self._single_copy_enabled()
         result: dict[str, dict] = {}
         for req_id, base_key in req_id_to_key.items():
             layers = per_request.get(req_id)
             if not layers:
                 continue
+            subkey = f"{base_key}::hidden_states"
+            if single_copy:
+                # Single-copy path: stage the GPU layer tensors straight into a
+                # pinned registered buffer (one DMA/layer, byte-identical to the
+                # (n_layers, seq, H) stacked layout), then RDMA from it. The
+                # stage holds a pinned-pool slot (its own backpressure); the
+                # commit (event-wait + RDMA) runs inline (sync) or on the bg
+                # thread (async), overlapping the next prefill.
+                pool_size = max(depth, 1)
+                staged = store.stage_hidden_states(subkey, layers, pool_size=pool_size)
+                if depth <= 1:
+                    result[req_id] = store.commit_staged_put(staged)
+                else:
+                    self._submit_async_commit(store, staged)
+                    result[req_id] = dict(staged.meta)
+                continue
             # Match CamelotSample.from_emitter_dict: stack layers on dim 0 ->
             # (n_layers, seq, H), contiguous, on CPU.
             hs = torch.stack([h.contiguous().to("cpu") for h in layers], dim=0)
-            subkey = f"{base_key}::hidden_states"
             if depth <= 1:
                 # Synchronous path (default): the RDMA put runs inline and the
                 # returned descriptor is the store's own.
@@ -483,6 +499,41 @@ class HiddenStatesWorkerExtension:
         except (TypeError, ValueError):
             return 1
 
+    def _single_copy_enabled(self) -> bool:
+        """Whether to use the single GPU->pinned DMA stage/commit put path.
+
+        ``CAMELOT_WORKER_SINGLE_COPY_HS`` in (1,true,yes,on) routes the capture
+        through ``MooncakeBlobStore.stage_hidden_states`` /
+        ``commit_staged_put`` (TorchSpec-faithful one-copy), eliminating the
+        GPU->pageable DtoH + stack + restage of the default path. Off by
+        default; the async-put depth gate still controls inline vs bg commit.
+        """
+        return os.environ.get("CAMELOT_WORKER_SINGLE_COPY_HS", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    def _ensure_put_executor(self) -> None:
+        if getattr(self, "_put_executor", None) is None:
+            self._put_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="mooncake-put"
+            )
+            self._inflight_puts: list[tuple[Future, str]] = []
+
+    def _submit_async_commit(self, store, staged) -> None:
+        """Enqueue a staged single-copy put's RDMA commit on the bg thread.
+
+        Backpressure is provided by the pinned-pool slot the stage already
+        holds (``stage_hidden_states`` blocks when all slots are in flight), so
+        this only reaps finished commits for deferred fail-fast and submits.
+        """
+        self._ensure_put_executor()
+        self._reap_inflight_puts(block=False)
+        fut = self._put_executor.submit(store.commit_staged_put, staged)
+        self._inflight_puts.append((fut, staged.keys[0]))
+
     def _submit_async_put(self, store, subkey: str, hs: "torch.Tensor", depth: int) -> None:
         """Enqueue one ``put_raw_tensor`` on the background writer thread.
 
@@ -492,10 +543,7 @@ class HiddenStatesWorkerExtension:
         the worker can never outrun the writer / RDMA segment unboundedly.
         """
         if getattr(self, "_put_executor", None) is None:
-            self._put_executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="mooncake-put"
-            )
-            self._inflight_puts: list[tuple[Future, str]] = []
+            self._ensure_put_executor()
         self._reap_inflight_puts(block=False)
         while len(self._inflight_puts) >= depth:
             oldest_fut, oldest_key = self._inflight_puts.pop(0)
