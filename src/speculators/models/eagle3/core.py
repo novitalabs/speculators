@@ -13,6 +13,7 @@ from speculators.models.eagle3 import Eagle3SpeculatorConfig
 from speculators.models.eagle3.attention import (
     create_combined_mask_mod,
     extend_mask_for_draft_tokens,
+    mla_flex_enabled,
 )
 from speculators.models.eagle3.model_definitions import model_classes
 from speculators.proposals.greedy import GreedyTokenProposalConfig
@@ -432,9 +433,12 @@ class Eagle3DraftModel(SpeculatorModel):
         past_key_values = DynamicCache(config=self.config.transformer_layer_config)
 
         # Build attention mask: dense 4D for models without flex_attention (K2.5),
-        # BlockMask for models that support it (Llama, Qwen3)
+        # BlockMask for models that support it (Llama, Qwen3). When CAMELOT_MLA_FLEX
+        # is set, the MLA drafts (kimi_k2 / deepseek_v3) also take the BlockMask
+        # flex path (KV grows across TTT steps; mask extended per step below).
         model_type = self.config.transformer_layer_config.model_type
-        if model_type in _DENSE_MASK_MODEL_TYPES:
+        use_dense_mask = model_type in _DENSE_MASK_MODEL_TYPES and not mla_flex_enabled()
+        if use_dense_mask:
             attention_mask = build_packed_attention_mask(
                 lengths, total_seq_len, hidden_states.dtype, device
             )

@@ -1,4 +1,5 @@
 # ruff: noqa: ERA001
+import os
 from typing import cast
 
 import torch
@@ -9,6 +10,22 @@ from torch.nn.attention.flex_attention import (
     or_masks,
 )
 from transformers.modeling_utils import AttentionInterface
+
+
+def mla_flex_enabled() -> bool:
+    """Whether the kimi/deepseek MLA Eagle3 draft uses the flex_attention path.
+
+    Default off: the MLA draft keeps the legacy dense [1,1,T,T] mask + SDPA path
+    (byte-identical to the pre-flag behavior). Set CAMELOT_MLA_FLEX=1 to route MLA
+    through the block-sparse flex_attention path with a growing KV cache across TTT
+    steps (TorchSpec-faithful; mirrors DeepSeekMLAFlexAttention).
+    """
+    return os.environ.get("CAMELOT_MLA_FLEX", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def create_combined_mask_mod(lengths: torch.Tensor, total_seq_len: int):

@@ -29,6 +29,25 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
+
+
+# Compile flex_attention once (singleton). On CUDA, torch.compile(flex_attention)
+# is the supported, fast path (and what the live trainer uses). On CPU,
+# torch.compile(flex_attention) only supports inference (no backward), so fall
+# back to the uncompiled symbol there — numerically identical, just slower, and
+# only used by the equivalence gate / CPU tests. Do not compile while already
+# inside a torchdynamo trace (it raises) — use the eager symbol there too.
+_COMPILED_FLEX_ATTENTION = None
+
+
+def _compile_friendly_flex_attention(query, key, value, **kwargs):
+    global _COMPILED_FLEX_ATTENTION
+    if query.device.type != "cuda" or torch._dynamo.is_compiling():  # noqa: SLF001
+        return flex_attention(query, key, value, **kwargs)
+    if _COMPILED_FLEX_ATTENTION is None:
+        _COMPILED_FLEX_ATTENTION = torch.compile(flex_attention)
+    return _COMPILED_FLEX_ATTENTION(query, key, value, **kwargs)
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -1246,10 +1265,114 @@ class DeepseekV3SdpaAttention(DeepseekV3Attention):
         return attn_output, None, past_key_value
 
 
+class DeepseekV3FlexAttention(DeepseekV3SdpaAttention):
+    """MLA attention using flex_attention (block-sparse) for packed Eagle3 training.
+
+    Mirrors DeepseekV3SdpaAttention through q/k/v assembly, RoPE, and the growing
+    KV cache, but dispatches a `BlockMask` attention_mask to flex_attention
+    (O(Sum doc_i^2), no dense T*T materialization) instead of SDPA. A dense-tensor
+    attention_mask falls back to SDPA (byte-identical to the parent), so this class
+    is safe even if a caller passes a 4D mask. TorchSpec-faithful: mirrors
+    DeepSeekMLAFlexAttention (deepseek_eagle.py). q/k are qk_head_dim=192, v is
+    v_head_dim=128 (unequal); flex_attention output follows the V head_dim, same as
+    SDPA.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+               Optional[Tuple[torch.Tensor]]]:
+        # A dense-tensor mask (or no BlockMask) means the legacy dense path — defer
+        # to the parent SDPA forward verbatim (byte-identical fallback).
+        if not isinstance(attention_mask, BlockMask):
+            return super().forward(
+                hidden_states, attention_mask=attention_mask,
+                position_ids=position_ids, past_key_value=past_key_value,
+                output_attentions=output_attentions, use_cache=use_cache,
+                **kwargs,
+            )
+        if output_attentions:
+            raise ValueError(
+                "DeepseekV3FlexAttention does not support output_attentions")
+
+        bsz, q_len, _ = hidden_states.size()
+
+        if self.q_lora_rank is None:
+            q = self.q_proj(hidden_states)
+        else:
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+        q_nope, q_pe = torch.split(
+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+        compressed_kv, k_pe = torch.split(
+            compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
+        kv = (self.kv_b_proj(self.kv_a_layernorm(compressed_kv)).view(
+            bsz, q_len, self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2))
+
+        k_nope, value_states = torch.split(
+            kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        kv_seq_len = value_states.shape[-2]
+        if past_key_value is not None:
+            if self.layer_idx is None:
+                raise ValueError(
+                    "The cache structure has changed since version v4.36. "
+                    "Please make sure to provide a `layer_idx`.")
+            kv_seq_len += get_usable_length(past_key_value, kv_seq_len,
+                                            self.layer_idx)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
+
+        query_states = k_pe.new_empty(bsz, self.num_heads, q_len,
+                                      self.q_head_dim)
+        query_states[:, :, :, :self.qk_nope_head_dim] = q_nope
+        query_states[:, :, :, self.qk_nope_head_dim:] = q_pe
+
+        key_states = k_pe.new_empty(bsz, self.num_heads, q_len,
+                                    self.q_head_dim)
+        key_states[:, :, :, :self.qk_nope_head_dim] = k_nope
+        key_states[:, :, :, self.qk_nope_head_dim:] = k_pe
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos}
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs)
+
+        # Block-sparse attention over the (growing) packed KV. flex_attention
+        # accepts v_head_dim (128) != qk_head_dim (192); output follows V, same as
+        # SDPA. The BlockMask already encodes per-document causal + per-TTT-step
+        # suffix-diagonal structure (KV_LEN grows with the cache).
+        attn_output = _compile_friendly_flex_attention(
+            query_states.contiguous(),
+            key_states.contiguous(),
+            value_states.contiguous(),
+            block_mask=attention_mask,
+            scale=self.softmax_scale,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len,
+                                          self.num_heads * self.v_head_dim)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
+
+
 ATTENTION_CLASSES = {
     "eager": DeepseekV3Attention,
     "flash_attention_2": DeepseekV3FlashAttention2,
     "sdpa": DeepseekV3SdpaAttention,
+    "simple_flex_attention": DeepseekV3FlexAttention,
 }
 
 

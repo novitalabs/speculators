@@ -160,8 +160,14 @@ try:
                 layer_idx: int,
                 norm_before_residual: bool = False,
             ):
-                # Use SDPA for memory-efficient attention (eager OOMs on long packed sequences)
-                config._attn_implementation = "sdpa"
+                # Flex (block-sparse, growing KV) when CAMELOT_MLA_FLEX is set;
+                # otherwise SDPA over a dense 4D mask (eager OOMs on long packed
+                # sequences). Both are memory-efficient; flex avoids the O(T^2)
+                # dense mask entirely.
+                from speculators.models.eagle3.attention import mla_flex_enabled
+                config._attn_implementation = (
+                    "simple_flex_attention" if mla_flex_enabled() else "sdpa"
+                )
                 super().__init__(config, layer_idx)
                 self._patch_eagle3_projections_mla(config, _DsRMSNorm, norm_before_residual)
 
@@ -187,16 +193,23 @@ try:
             def forward(self, hidden_states, attention_mask=None, position_ids=None,
                         past_key_values=None, use_cache=False, cache_position=None,
                         position_embeddings=None, **kwargs):
-                # Reject BlockMask — K2.5 requires dense 4D mask with document boundaries.
-                if attention_mask is not None and not isinstance(attention_mask, torch.Tensor):
+                from speculators.models.eagle3.attention import mla_flex_enabled
+                flex = mla_flex_enabled()
+
+                # Dense path requires a 4D tensor mask; flex path consumes a BlockMask.
+                if not flex and attention_mask is not None and not isinstance(
+                    attention_mask, torch.Tensor
+                ):
                     raise TypeError(
                         f"Eagle3 K2.5 first layer received non-tensor attention_mask "
                         f"(type={type(attention_mask).__name__}). Use build_packed_attention_mask()."
                     )
 
-                # Reset cache_position: Eagle3 TTT uses arange(step*S, (step+1)*S)
-                # but K2.5 MLA interprets large values as kv_seq_len offset
-                if cache_position is not None:
+                # Dense path: reset cache_position (Eagle3 TTT uses arange(step*S,
+                # (step+1)*S) but K2.5 MLA reads large values as a kv_seq_len offset).
+                # Flex path: KV grows across TTT steps via the DynamicCache, so leave
+                # cache_position alone (mirrors Llama/Qwen3).
+                if not flex and cache_position is not None:
                     cache_position = torch.arange(
                         hidden_states.shape[1], device=hidden_states.device
                     )
@@ -216,13 +229,15 @@ try:
                     residual = hidden
                 hidden_states = torch.cat([embeds, hidden], dim=-1)
 
-                # K2.5 attention returns (output, weights, past_kv) — 3 values
+                # K2.5 MLA attention takes `past_key_value` (singular) + use_cache;
+                # passing the plural name would silently drop the cache (kwargs), so
+                # the flex path must pass it explicitly to grow KV across TTT steps.
                 attn_result = self.self_attn(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
+                    past_key_value=past_key_values,
+                    use_cache=use_cache or flex,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                     **kwargs,
