@@ -244,6 +244,13 @@ class DistributedCheckpointer(BaseCheckpointer):
             weights_only=True,
             map_location="cpu",
         )
+        if not isinstance(optimizer, torch.optim.Optimizer):
+            # fp32-master wrapper (REPLICATE FP32MasterAdamW): its state is keyed
+            # by fp32 master clones DCP can't map to model FQNs; the wrapper owns
+            # the full round-trip. No dtype convert — the fp32 masters are exact.
+            optimizer.load_state_dict(full_state_dict)
+            dist.barrier()
+            return
         full_state_dict = convert_float_dtype(
             full_state_dict, float_dtype or model.dtype
         )
@@ -274,12 +281,20 @@ class DistributedCheckpointer(BaseCheckpointer):
         )
         model_state_dict = convert_float_dtype(model_state_dict, float_dtype)
 
-        optimizer_state_dict = get_optimizer_state_dict(
-            model,
-            optimizer,
-            options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-        )
-        optimizer_state_dict = convert_float_dtype(optimizer_state_dict, float_dtype)
+        if not isinstance(optimizer, torch.optim.Optimizer):
+            # fp32-master wrapper (REPLICATE FP32MasterAdamW): DCP's
+            # get_optimizer_state_dict maps params by identity to model FQNs and
+            # can't see the fp32 master clones ('FP32MasterAdamW' object is not
+            # iterable). The wrapper serializes itself (TorchSpec BF16Optimizer
+            # parity); no dtype downcast — the fp32 masters are the point.
+            optimizer_state_dict = optimizer.state_dict()
+        else:
+            optimizer_state_dict = get_optimizer_state_dict(
+                model,
+                optimizer,
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            )
+            optimizer_state_dict = convert_float_dtype(optimizer_state_dict, float_dtype)
 
         if dist.get_rank() == 0:
             # Only rank 0 saves the checkpoint
