@@ -10,6 +10,7 @@ from torch.nn.attention.flex_attention import (
     or_masks,
 )
 from transformers.modeling_utils import AttentionInterface
+from transformers.utils import is_torchdynamo_compiling
 
 
 def mla_flex_enabled() -> bool:
@@ -155,6 +156,63 @@ def block_mask_to_dense_attention_mask(
     return attention_mask
 
 
+class _WrappedFlexAttention:
+    """Singleton holding a lazily ``torch.compile``d ``flex_attention``.
+
+    Eager ``flex_attention`` is an unfused fallback that materializes the full
+    Q×KV scores matrix — at trainer sequence lengths (~20k) it is ~2 orders of
+    magnitude slower than the compiled fused kernel and dominates step time.
+    TorchSpec parity: mirrors ``compile_friendly_flex_attention`` (itself the
+    HF integrations/flex_attention.py pattern). Opt out with
+    CAMELOT_FLEX_COMPILE=0 (falls back to the eager call).
+    """
+
+    _instance = None
+    _compiled = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    @torch.compiler.disable(recursive=False)
+    def __init__(self):
+        if self._compiled is None:
+            # Variable pack lengths recompile per new shape until dynamic
+            # shapes kick in; keep headroom (TorchSpec sets the same limit).
+            try:
+                torch._dynamo.config.recompile_limit = 128  # noqa: SLF001
+            except AttributeError:
+                torch._dynamo.config.cache_size_limit = 128  # noqa: SLF001
+            import torch._inductor.config as inductor_config
+
+            # Without the ATEN fallback inductor's GEMM autotuner can raise
+            # NoValidChoicesError in the flex backward (TorchSpec issue 10).
+            if "ATEN" not in getattr(inductor_config, "max_autotune_gemm_backends", ""):
+                inductor_config.max_autotune_gemm_backends = "ATEN,TRITON"
+            # Instance attribute on purpose: a plain function stored on the
+            # class would be bound as a method (self injected as `query`).
+            self._compiled = torch.compile(flex_attention)
+
+    def __call__(self):
+        return self._compiled
+
+
+def _flex_attention_fn():
+    if os.environ.get("CAMELOT_FLEX_COMPILE", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return flex_attention
+    # Inside an outer torch.compile region the nested compiled wrapper raises;
+    # dynamo traces the plain call instead (HF/TorchSpec behavior).
+    if is_torchdynamo_compiling():
+        return flex_attention
+    return _WrappedFlexAttention()()
+
+
 def flex_attention_forward(
     module: torch.nn.Module,  # noqa: ARG001
     query: torch.Tensor,
@@ -181,7 +239,7 @@ def flex_attention_forward(
         attention_output = attention_output.transpose(1, 2).contiguous()
         return attention_output, None
 
-    flex_attention_output = flex_attention(
+    flex_attention_output = _flex_attention_fn()(
         query,
         key,
         value,
