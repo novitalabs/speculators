@@ -216,8 +216,13 @@ try:
 
                 # Eagle3 uses 1-indexed position_ids, but K2.5 rotary embedding
                 # returns cos[:seq_len] (0-indexed). Shift to 0-indexed to avoid OOB.
-                if position_ids is not None and position_ids.min() >= 1:
-                    position_ids = position_ids - 1
+                # Branch-free: `if position_ids.min() >= 1` coerces a CUDA tensor
+                # to bool, which drains the stream mid-forward (profiled ~0.6s
+                # stalls per step at 20k); subtract the 0/1 flag on-device instead.
+                if position_ids is not None:
+                    position_ids = position_ids - (position_ids.min() >= 1).to(
+                        position_ids.dtype
+                    )
 
                 # Eagle3 first-layer logic (reimplemented to handle K2.5 MLA 3-tuple return)
                 mid = hidden_states.shape[2] // 2
