@@ -21,9 +21,12 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_utils import (
     _get_kv_cache_groups_uniform_spec,
+    generate_scheduler_kv_cache_config,
     get_kv_cache_config_from_groups,
+    get_kv_cache_groups,
     get_request_block_hasher,
     init_none_hash,
+    is_kv_cache_spec_uniform,
     unify_hybrid_kv_cache_specs,
 )
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -184,7 +187,13 @@ class VllmHiddenStatesGenerator:
         # Normalize hybrid KV cache specs for models with non-uniform attention
         # (e.g., GPT-OSS with sliding/full attention layers)
         unify_hybrid_kv_cache_specs(kv_cache_spec)
-        kv_cache_groups = _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+        if is_kv_cache_spec_uniform(kv_cache_spec):
+            kv_cache_groups = _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+        else:
+            # Heterogeneous specs survive unification (e.g. GLM/DeepSeek DSA:
+            # MLA layers + indexer layers with a different cache dtype) —
+            # mirror EngineCore and let vLLM split them into hybrid groups.
+            kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
 
         free_memory, _ = mem_get_info()
         cache_memory = int(free_memory * gpu_memory_utilization * CACHE_MEMORY_FRACTION)
@@ -200,9 +209,17 @@ class VllmHiddenStatesGenerator:
             vllm_config=self.vllm_config
         )
 
+        # The scheduler cannot manage UniformTypeKVCacheSpecs groups (no entry
+        # in spec_manager_map); EngineCore substitutes a representative
+        # concrete spec via generate_scheduler_kv_cache_config. Workers still
+        # get the raw config below.
+        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
+            [kv_cache_config]
+        )
+
         self.scheduler = Scheduler(
             vllm_config=self.vllm_config,
-            kv_cache_config=kv_cache_config,
+            kv_cache_config=scheduler_kv_cache_config,
             structured_output_manager=structured_output_manager,
             block_size=VLLM_BLOCK_SIZE,
         )

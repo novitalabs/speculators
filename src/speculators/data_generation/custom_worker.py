@@ -13,6 +13,12 @@ import torch
 from vllm.distributed import get_pp_group, get_tp_group
 from vllm.sequence import IntermediateTensors
 
+from speculators.utils.hf_compat import register_glm_moe_dsa
+
+# Workers unpickle VllmConfig.hf_config and may resolve tokenizer/config via
+# AutoConfig; register before any of that happens.
+register_glm_moe_dsa()
+
 __all__ = ["HiddenStatesWorkerExtension"]
 
 logger = logging.getLogger(__name__)
