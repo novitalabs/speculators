@@ -104,6 +104,7 @@ class VllmHiddenStatesGenerator:
         max_prompt_len: int | None = None,
         model_loader_extra_config: dict | None = None,
         compilation_config: dict | None = None,
+        attention_backend: str | None = None,
     ):
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
@@ -173,7 +174,10 @@ class VllmHiddenStatesGenerator:
             trust_remote_code=trust_remote_code,
             model_loader_extra_config=model_loader_extra_config,
             compilation_config=compilation_config,
+            attention_backend=attention_backend,
         )
+        if attention_backend:
+            log.info(f"Forcing attention backend: {attention_backend}")
 
         log.info("Initializing executor...")
         self.executor = MultiprocExecutor(vllm_config=self.vllm_config)
@@ -251,6 +255,7 @@ class VllmHiddenStatesGenerator:
         trust_remote_code: bool = True,
         model_loader_extra_config: dict | None = None,
         compilation_config: dict | None = None,
+        attention_backend: str | None = None,
     ) -> VllmConfig:
         """Create VllmConfig with hidden states worker extension"""
         cache_config = CacheConfig(
@@ -273,6 +278,31 @@ class VllmHiddenStatesGenerator:
         kwargs = {}
         if compilation_config:
             kwargs["compilation_config"] = CompilationConfig(**compilation_config)
+
+        # Attention backend override.
+        #
+        # WHY THIS EXISTS: on B300 (compute capability 10.3) vLLM 0.17.0
+        # *forces* FLASHINFER_MLA for any MLA model whose qk_nope_head_dim is
+        # 128 — see vllm/platforms/cuda.py, "Blackwell => Force FlashInfer MLA".
+        # FlashInfer does not compile those kernels; it downloads prebuilt
+        # cubins, and every one of the 8,934 shipped in flashinfer_cubin is
+        # `sm100f`/`Sm100a`. `sm_100a` is arch-CONDITIONAL, so it never runs
+        # forward onto 10.3, and the wheel carries no PTX to JIT from. The
+        # engine therefore loads all weights, sets up capture hooks, autotunes,
+        # and then dies at the first real forward pass with
+        # `cudaErrorNoKernelImageForDevice` — surfaced against a nearby
+        # `x.to(torch.float32)` in layernorm because CUDA reports async.
+        #
+        # TRITON_MLA is JIT-compiled by Triton for the live device, so it
+        # targets 10.3 natively. Note VLLM_ATTENTION_BACKEND does NOT work
+        # here: 0.17.0 removed it from envs.py in favour of this config field.
+        if attention_backend:
+            from vllm.config.attention import AttentionConfig
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+            kwargs["attention_config"] = AttentionConfig(
+                backend=AttentionBackendEnum[attention_backend]
+            )
 
         return VllmConfig(
             model_config=ModelConfig(
