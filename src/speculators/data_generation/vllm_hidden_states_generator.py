@@ -105,6 +105,7 @@ class VllmHiddenStatesGenerator:
         model_loader_extra_config: dict | None = None,
         compilation_config: dict | None = None,
         attention_backend: str | None = None,
+        disable_flashinfer_prefill: bool = False,
     ):
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
@@ -175,9 +176,12 @@ class VllmHiddenStatesGenerator:
             model_loader_extra_config=model_loader_extra_config,
             compilation_config=compilation_config,
             attention_backend=attention_backend,
+            disable_flashinfer_prefill=disable_flashinfer_prefill,
         )
         if attention_backend:
             log.info(f"Forcing attention backend: {attention_backend}")
+        if disable_flashinfer_prefill:
+            log.info("Disabling FlashInfer MLA prefill wrapper")
 
         log.info("Initializing executor...")
         self.executor = MultiprocExecutor(vllm_config=self.vllm_config)
@@ -256,6 +260,7 @@ class VllmHiddenStatesGenerator:
         model_loader_extra_config: dict | None = None,
         compilation_config: dict | None = None,
         attention_backend: str | None = None,
+        disable_flashinfer_prefill: bool = False,
     ) -> VllmConfig:
         """Create VllmConfig with hidden states worker extension"""
         cache_config = CacheConfig(
@@ -296,13 +301,28 @@ class VllmHiddenStatesGenerator:
         # TRITON_MLA is JIT-compiled by Triton for the live device, so it
         # targets 10.3 natively. Note VLLM_ATTENTION_BACKEND does NOT work
         # here: 0.17.0 removed it from envs.py in favour of this config field.
-        if attention_backend:
+        # `disable_flashinfer_prefill` is a SEPARATE switch from `backend`, and on
+        # B300 (sm_103) it has to be set independently. `use_flashinfer_prefill()`
+        # (mla_attention.py:1226) turns FlashInfer's prefill wrapper on for ANY
+        # device-capability family 100 whenever flashinfer merely imports — it never
+        # consults the selected backend — so TRITON_MLA does not remove it. The
+        # wrapper then dies in its own AOT kernel:
+        #   mla_attention.py:1568 _build_fi_prefill_wrappers
+        #     -> flashinfer/prefill.py:3241 fmha_varlen_plan
+        #       -> blackwell_fmha_plan.cu:36
+        #   RuntimeError: Failed to plan blackwell fmha ... no kernel image (209)
+        # This is the THIRD distinct FlashInfer site on this card, after RoPE and the
+        # MLA cubins, and it is reached during real generation rather than warmup.
+        if attention_backend or disable_flashinfer_prefill:
             from vllm.config.attention import AttentionConfig
             from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-            kwargs["attention_config"] = AttentionConfig(
-                backend=AttentionBackendEnum[attention_backend]
-            )
+            attn_kwargs: dict = {}
+            if attention_backend:
+                attn_kwargs["backend"] = AttentionBackendEnum[attention_backend]
+            if disable_flashinfer_prefill:
+                attn_kwargs["disable_flashinfer_prefill"] = True
+            kwargs["attention_config"] = AttentionConfig(**attn_kwargs)
 
         return VllmConfig(
             model_config=ModelConfig(
