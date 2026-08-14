@@ -1,3 +1,4 @@
+import logging
 from typing import ClassVar
 
 import torch
@@ -15,6 +16,11 @@ from speculators.models.dflash import DFlashSpeculatorConfig
 from speculators.models.dflash.attention import create_anchor_block_mask_mod
 from speculators.models.dflash.metrics import compute_metrics
 from speculators.models.dflash.model_definitions import Qwen3DFlashDecoderLayer
+from speculators.models.dflash.model_definitions_mla import (
+    MLADFlashDecoderLayer,
+    MLARMSNorm,
+    MLARotaryEmbedding,
+)
 from speculators.models.dflash.utils import (
     get_base_indices_for_anchored_blocks,
     select_anchors,
@@ -22,11 +28,13 @@ from speculators.models.dflash.utils import (
 from speculators.models.metrics import LossConfig, resolve_loss_config
 from speculators.models.utils import conditional_torch_compile, resolve_target_layer_ids
 
+logger = logging.getLogger(__name__)
+
 
 @SpeculatorModel.register("dflash")
 class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     config_class: ClassVar[type[DFlashSpeculatorConfig]] = DFlashSpeculatorConfig  # type: ignore[misc]
-    _no_split_modules = ["Qwen3DFlashDecoderLayer"]
+    _no_split_modules = ["Qwen3DFlashDecoderLayer", "MLADFlashDecoderLayer"]
     _keys_to_ignore_on_load_missing: ClassVar[list[str]] = [  # type: ignore[misc]
         "embed_tokens.weight",
         "verifier_norm.weight",
@@ -48,11 +56,41 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self,
         config: DFlashSpeculatorConfig,
     ) -> None:
+        # MLA or GQA backbone? Decided from the config's own geometry, not from a
+        # separate flag: a config carrying kv_lora_rank + qk_rope_head_dim IS an
+        # MLA config (DeepseekV3Config / KimiLinearConfig), and one without them
+        # cannot build MLA projections at all. Deriving it here keeps the choice
+        # consistent between construction and any later reload of the same
+        # config, which a duplicated flag would not.
+        self._is_mla = bool(
+            getattr(config.transformer_layer_config, "kv_lora_rank", None)
+            and getattr(config.transformer_layer_config, "qk_rope_head_dim", None)
+        )
+
         # Forcibly override config settings
         if config.transformer_layer_config._attn_implementation is None:  # noqa: SLF001
             config.transformer_layer_config._attn_implementation = (  # noqa: SLF001
                 "simple_flex_attention"
             )
+        if self._is_mla and (
+            config.transformer_layer_config._attn_implementation  # noqa: SLF001
+            == "simple_flex_attention"
+        ):
+            # MLA cannot use flex_attention: its query/key head dim
+            # (qk_nope + qk_rope = 192 for K3) differs from its value head dim
+            # (v_head_dim = 128), and the flex kernel assumes a single head_dim
+            # for all three. train.py's kimi_k2 branch already forces "sdpa" for
+            # this reason; do it here too so an MLA draft is correct regardless
+            # of which config builder produced it (`draft_attn_impl` in a YAML
+            # reaches this class directly via _build_base_config_kwargs).
+            logger.warning(
+                "MLA draft cannot use simple_flex_attention "
+                "(q/k head_dim %d != v_head_dim %d); forcing sdpa.",
+                config.transformer_layer_config.qk_nope_head_dim
+                + config.transformer_layer_config.qk_rope_head_dim,
+                config.transformer_layer_config.v_head_dim,
+            )
+            config.transformer_layer_config._attn_implementation = "sdpa"  # noqa: SLF001
         self._attn_impl = config.transformer_layer_config._attn_implementation  # noqa: SLF001
         self._create_mask_fn = (
             create_block_mask
@@ -66,36 +104,50 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         tl_config = config.transformer_layer_config
 
+        layer_class = MLADFlashDecoderLayer if self._is_mla else Qwen3DFlashDecoderLayer
+        norm_class = MLARMSNorm if self._is_mla else Qwen3RMSNorm
+
         # Number of draft layers is encoded in transformer_layer_config
         num_draft_layers = tl_config.num_hidden_layers
         self.layers = nn.ModuleList(
             [
-                Qwen3DFlashDecoderLayer(config.transformer_layer_config, layer_idx)  # type: ignore[arg-type]
+                layer_class(config.transformer_layer_config, layer_idx)  # type: ignore[arg-type]
                 for layer_idx in range(num_draft_layers)
             ]
         )
-        self.sliding_window = tl_config.sliding_window
+        # DeepseekV3Config declares neither `sliding_window` nor `layer_types`
+        # (verified), and MLA has no sliding variant in this draft, so both
+        # lookups fall back rather than AttributeError-ing on an MLA config.
+        self.sliding_window = getattr(tl_config, "sliding_window", None)
         self.sliding_window_indices = [
             i
-            for i, layer_type in enumerate(tl_config.layer_types)
+            for i, layer_type in enumerate(
+                getattr(tl_config, "layer_types", None) or []
+            )
             if layer_type == "sliding_attention"
         ]
         self.uses_sliding_window_attn = bool(self.sliding_window_indices)
         self.uses_full_attn = bool(num_draft_layers - len(self.sliding_window_indices))
         self.sliding_window_non_causal = config.sliding_window_non_causal
 
-        self.norm = Qwen3RMSNorm(
+        self.norm = norm_class(
             config.transformer_layer_config.hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
-        self.rotary_emb = Qwen3RotaryEmbedding(config.transformer_layer_config)  # type: ignore[arg-type]
+        # Qwen3RotaryEmbedding sizes inv_freq from head_dim; MLA rotates only the
+        # qk_rope_head_dim slice, so it needs its own (narrower) basis.
+        self.rotary_emb = (
+            MLARotaryEmbedding(config.transformer_layer_config)  # type: ignore[arg-type]
+            if self._is_mla
+            else Qwen3RotaryEmbedding(config.transformer_layer_config)  # type: ignore[arg-type]
+        )
 
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.transformer_layer_config.hidden_size,
             config.transformer_layer_config.hidden_size,
             bias=False,
         )
-        self.hidden_norm = Qwen3RMSNorm(
+        self.hidden_norm = norm_class(
             config.transformer_layer_config.hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
@@ -103,7 +155,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         # pre-norm hidden states; DraftVocabMixin.load_verifier_weights gates
         # on hasattr(self, "verifier_norm").
         if config.apply_verifier_norm:
-            self.verifier_norm = Qwen3RMSNorm(
+            self.verifier_norm = norm_class(
                 config.transformer_layer_config.hidden_size,
                 eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
             )
