@@ -6,6 +6,7 @@ The confidence target ``accept_rate = sum_v min(q_v, p_v) = 1 - d_TV`` is the
 analytical acceptance rate (the overlap ``tv_loss`` already computes).
 """
 
+import os
 from collections.abc import Callable
 from functools import partial
 from typing import Any
@@ -65,9 +66,25 @@ def compute_metrics(
 
     # Analytical per-position acceptance rate = distributional overlap.
     with torch.no_grad():
-        draft_p = softmax(logits.float(), dim=-1)
-        target_p = softmax(targets.float(), dim=-1)
-        accept_rate = torch.minimum(draft_p, target_p).sum(dim=-1)  # [1, T]
+        # Chunked over the sequence. The unchunked spelling upcast BOTH logits and
+        # targets to fp32 and held them at once: at Kimi-K3's identity vocab
+        # (V=163840) with max_anchors 384 * block 8 = 3072 positions that is
+        # 1.88 GiB each, 3.75 GiB live, purely to reduce to a [1, T] vector.
+        # exp50n OOM'd on exactly this (allocator asked for 3072*163840*4 =
+        # 2013265920 bytes). softmax and the min-overlap sum are both along the
+        # LAST dim, so slicing the sequence is exact rather than an approximation
+        # -- no cross-position term exists to lose.
+        _chunk = max(1, int(os.environ.get("SPECULATORS_ACCEPT_CHUNK", "512")))
+        accept_rate = torch.cat(
+            [
+                torch.minimum(
+                    softmax(logits[:, i : i + _chunk].float(), dim=-1),
+                    softmax(targets[:, i : i + _chunk].float(), dim=-1),
+                ).sum(dim=-1)
+                for i in range(0, seq_len, _chunk)
+            ],
+            dim=1,
+        )  # [1, T]
         # Per-block cumulative acceptance product over the draft slots (slot 0
         # is the anchor), shared by the accept-length and calibration metrics.
         num_blocks = seq_len // block_size
