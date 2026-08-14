@@ -405,10 +405,24 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 verifier_last_hidden_states = self.verifier_norm(
                     verifier_last_hidden_states
                 )
-            verifier_logits = self.verifier_lm_head(verifier_last_hidden_states)
-            # Shift right by 1 so verifier_logits[i] predicts token at position i
-            verifier_logits = torch.roll(verifier_logits, 1, dims=1)
-            targets = verifier_logits[:, anchored_block_indices]
+            # Project ONLY the positions `targets` actually keeps. The obvious
+            # spelling -- lm_head over all of total_seq_len, roll, then slice --
+            # materialises a [1, total_seq_len, draft_vocab_size] tensor and
+            # `roll` allocates a second full copy of it. At K3's identity vocab
+            # (V=163840, seq_length=8192) that is 2.50 GiB per bf16 copy and
+            # 5.00 GiB in fp32, versus 0.94 / 1.88 for the anchored slice that
+            # survives: a 2.7x overshoot on the single largest allocation in the
+            # step, and the one that OOM'd here (the allocator asked for exactly
+            # 8192*163840*4 = 5368709120 bytes on a card already holding vLLM's
+            # 224.9 GiB). max_anchors was tuned on the assumption that every
+            # V-wide tensor is anchor-sized; this was the one that wasn't.
+            #
+            # Equivalence: roll(x, 1, dims=1)[:, i] == x[:, (i - 1) % S], so
+            # gathering the shifted source rows first and projecting those is the
+            # same arithmetic on the same rows, just without the discarded ones.
+            # verifier_norm is per-position (RMSNorm), so it is unaffected.
+            _shifted = (anchored_block_indices - 1) % total_seq_len
+            targets = self.verifier_lm_head(verifier_last_hidden_states[:, _shifted])
             # shape: [1, num_anchors*block_size, draft_vocab_size]
 
         for layer_idx, layer in enumerate(self.layers):
