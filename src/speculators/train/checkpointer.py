@@ -186,6 +186,22 @@ class SingleGPUCheckpointer(BaseCheckpointer):
             weights_only=True,
             map_location=device,
         )
+        if not isinstance(optimizer, torch.optim.Optimizer):
+            # Same guard DistributedCheckpointer already applies (see its
+            # load_optimizer_state_dict / save_checkpoint): a non-Optimizer
+            # wrapper owns its whole round-trip and must NOT be downcast.
+            #
+            # Without this, convert_float_dtype casts every floating-point entry
+            # to model.dtype (bf16) and recurses into nested dicts via
+            # pytree.tree_map -- which reaches bitsandbytes' quantization state
+            # even though bnb declares qmap/absmax/state in
+            # non_castable_tensor_keys and hides them inside
+            # __bnb_optimizer_quant_state__ to keep FSDP away. Measured on a
+            # 2.3 B draft: absmax1/2 + qmap1/2 stored bf16 for all 56 quantized
+            # params, and the first post-resume step then wrote non-finite
+            # weights while its own loss and grad_norm still looked healthy.
+            optimizer.load_state_dict(full_state_dict)
+            return
         full_state_dict = convert_float_dtype(
             full_state_dict, float_dtype or model.dtype
         )
@@ -206,7 +222,16 @@ class SingleGPUCheckpointer(BaseCheckpointer):
     ):
         model_state_dict = convert_float_dtype(model.state_dict(), float_dtype)
         model.save_pretrained(self.path / str(epoch), state_dict=model_state_dict)
-        optimizer_state_dict = convert_float_dtype(optimizer.state_dict(), float_dtype)
+        if not isinstance(optimizer, torch.optim.Optimizer):
+            # Mirrors DistributedCheckpointer.save_checkpoint: a non-Optimizer
+            # wrapper serializes itself and keeps its own dtypes. Downcasting
+            # here defeats an fp32-master wrapper entirely (that residual is the
+            # whole reason it exists) and corrupts bnb quant state.
+            optimizer_state_dict = optimizer.state_dict()
+        else:
+            optimizer_state_dict = convert_float_dtype(
+                optimizer.state_dict(), float_dtype
+            )
         torch.save(optimizer_state_dict, self.optimizer_path(epoch))
         self._prune_old_checkpoints(epoch)
 
