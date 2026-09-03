@@ -124,12 +124,19 @@ class DSparkDraftModel(DFlashDraftModel):
         num_blocks = max_anchors
         block = self.block_size
         mask_tokens_size = num_blocks * block
-        # Ground-truth block tokens (verifier vocab); position 0 is the anchor.
+        # Ground-truth block tokens (verifier vocab); slot 0 holds the anchor.
         block_tokens = input_ids[0, anchored_block_indices].view(num_blocks, block)
-        # prev_token_ids[:, k] is the token preceding draft position k within the block.
-        prev_token_ids = torch.cat(
-            [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
-        )  # [num_blocks, block]
+        # prev_token_ids[:, k] is the token preceding draft position k.
+        if self.config.sample_from_anchor:
+            # Slot k predicts anchor+k+1, so the token at the previous position
+            # is block_tokens[:, k] itself -- no shift.
+            prev_token_ids = block_tokens
+        else:
+            # Slot k predicts anchor+k, so the previous token is
+            # block_tokens[:, k-1] (slot 0 is the untrained anchor).
+            prev_token_ids = torch.cat(
+                [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
+            )  # [num_blocks, block]
         hidden_blocks = hidden.view(num_blocks, block, -1)
 
         confidence_logits = None
@@ -167,6 +174,7 @@ class DSparkDraftModel(DFlashDraftModel):
             loss_config=loss_config or _DEFAULT_LOSS_CONFIG,
             gamma=gamma,
             confidence_head_alpha=confidence_head_alpha,
+            sample_from_anchor=self.config.sample_from_anchor,
         )
         draft_tokens = torch.argmax(logits, dim=-1)
         return draft_tokens, loss, metrics

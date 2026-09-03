@@ -23,6 +23,7 @@ def compute_metrics(
     block_size: int = 1,
     gamma: float = 4.0,
     loss_config: LossConfig | None = None,
+    sample_from_anchor: bool = False,
 ) -> tuple[torch.Tensor, dict]:
     """Compute loss and accuracy metrics for draft model predictions.
 
@@ -33,6 +34,9 @@ def compute_metrics(
         block_size: Block size for per-position metrics
         gamma: Temperature for exponential decay in loss weighting
         loss_config: Mapping of ``{name: (loss_fn, weight)}``
+        sample_from_anchor: When False, slot 0 is the anchor and is excluded
+            from the decay weighting and the accuracy metrics. When True every
+            slot is a trained prediction and slot 0 is included.
 
     Returns:
         Tuple of (loss, metrics_dict) where metrics_dict contains:
@@ -52,7 +56,9 @@ def compute_metrics(
         loss_mask,
         pos_idx,
         loss_config=loss_config,
-        decay_fn=partial(dflash_loss_decay, gamma=gamma),
+        decay_fn=partial(
+            dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
+        ),
     )
 
     pred_ids = torch.argmax(logits, dim=-1)
@@ -62,6 +68,9 @@ def compute_metrics(
         pred_ids, target_ids, loss_mask, pos_idx, block_size
     )
 
+    # Slot 0 is a real prediction only when sampling from the anchor.
+    start_pos = 0 if sample_from_anchor else 1
+
     ones = torch.tensor(1.0, device=logits.device)
     metrics: dict[str, Any] = {}
     metrics["loss_sum"] = loss.detach().clone()
@@ -69,11 +78,10 @@ def compute_metrics(
     for term_name, term_val in term_losses.items():
         metrics[f"{term_name}_sum"] = term_val
         metrics[f"{term_name}_total"] = ones
-    # Position 0 is the anchor — intentionally excluded from accuracy
-    metrics["full_acc_sum"] = correct_per_pos[1:].sum()
-    metrics["full_acc_total"] = total_per_pos[1:].sum()
+    metrics["full_acc_sum"] = correct_per_pos[start_pos:].sum()
+    metrics["full_acc_total"] = total_per_pos[start_pos:].sum()
 
-    for pos in range(1, block_size):
+    for pos in range(start_pos, block_size):
         metrics[f"position_{pos}_acc_sum"] = correct_per_pos[pos]
         metrics[f"position_{pos}_acc_total"] = total_per_pos[pos]
     return loss, metrics
