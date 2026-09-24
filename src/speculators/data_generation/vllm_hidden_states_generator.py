@@ -193,8 +193,29 @@ class VllmHiddenStatesGenerator:
         kv_cache_spec_list = self.executor.collective_rpc("get_kv_cache_spec")
         kv_cache_spec = kv_cache_spec_list[0]
         # Normalize hybrid KV cache specs for models with non-uniform attention
-        # (e.g., GPT-OSS with sliding/full attention layers)
-        unify_hybrid_kv_cache_specs(kv_cache_spec)
+        # (e.g., GPT-OSS with sliding/full attention layers).
+        #
+        # GATED, because calling this unconditionally makes Kimi-K3 impossible to
+        # capture. K3 is hybrid in a way this function cannot flatten: 24 MLA layers
+        # hold KV while the other 69 are KDA with mamba-style constant state, so
+        # `_promote_local_kv_cache_specs` has no promotion rule that unifies them and
+        # ends in `raise ValueError("Failed to promote local KV cache specs to one
+        # unified type.")` -- 30 minutes in, after the 1453.74 GiB weight load.
+        #
+        # vLLM itself only calls it behind this exact flag
+        # (kv_cache_utils.get_kv_cache_groups:1794):
+        #     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+        #         unify_hybrid_kv_cache_specs(kv_cache_spec)
+        # and `get_kv_cache_groups` -- which the else-branch below already calls --
+        # invokes it again under that same guard. So the unconditional call here was
+        # both redundant for the models it helped and fatal for K3: it raised before
+        # the multi-group path that handles heterogeneous specs could be reached.
+        #
+        # Matching vLLM's guard preserves the GPT-OSS/GLM/DSA behaviour exactly (the
+        # flag is what those paths set) and lets K3 fall through to the hybrid
+        # grouping that its 24-MLA/69-KDA split actually needs.
+        if self.vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+            unify_hybrid_kv_cache_specs(kv_cache_spec)
         if is_kv_cache_spec_uniform(kv_cache_spec):
             kv_cache_groups = _get_kv_cache_groups_uniform_spec(kv_cache_spec)
         else:
