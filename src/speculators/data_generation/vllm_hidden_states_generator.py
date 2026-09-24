@@ -25,6 +25,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
     get_request_block_hasher,
+    resolve_kv_cache_block_sizes,
     init_none_hash,
     is_kv_cache_spec_uniform,
     unify_hybrid_kv_cache_specs,
@@ -246,11 +247,29 @@ class VllmHiddenStatesGenerator:
             [kv_cache_config]
         )
 
+        # K3 is hybrid: 24 MLA groups + 69 Mamba groups, and the worker raises the
+        # attention block size at runtime (768 for K3, to make the attention page
+        # size >= the mamba page size). VLLM_BLOCK_SIZE is a REQUEST, not the
+        # outcome, so passing it to the scheduler trips
+        # kv_cache_coordinator's `scheduler_block_size % group.block_size == 0`.
+        # Derive it from the actual groups exactly as vllm/v1/engine/core.py does.
+        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+            scheduler_kv_cache_config, self.vllm_config
+        )
+        log.info(
+            "Scheduler block sizes resolved from %d KV cache group(s): "
+            "scheduler=%d hash=%d (VLLM_BLOCK_SIZE request was %d)",
+            len(scheduler_kv_cache_config.kv_cache_groups),
+            scheduler_block_size,
+            hash_block_size,
+            VLLM_BLOCK_SIZE,
+        )
         self.scheduler = Scheduler(
             vllm_config=self.vllm_config,
             kv_cache_config=scheduler_kv_cache_config,
             structured_output_manager=structured_output_manager,
-            block_size=VLLM_BLOCK_SIZE,
+            block_size=scheduler_block_size,
+            hash_block_size=hash_block_size,
         )
 
         log.info("Initializing KV cache on all workers...")
