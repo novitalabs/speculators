@@ -256,13 +256,12 @@ class VllmHiddenStatesGenerator:
         scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
             scheduler_kv_cache_config, self.vllm_config
         )
+        # PipelineLogger.info takes ONE preformatted string, not %-style args.
         log.info(
-            "Scheduler block sizes resolved from %d KV cache group(s): "
-            "scheduler=%d hash=%d (VLLM_BLOCK_SIZE request was %d)",
-            len(scheduler_kv_cache_config.kv_cache_groups),
-            scheduler_block_size,
-            hash_block_size,
-            VLLM_BLOCK_SIZE,
+            f"Scheduler block sizes resolved from "
+            f"{len(scheduler_kv_cache_config.kv_cache_groups)} KV cache group(s): "
+            f"scheduler={scheduler_block_size} hash={hash_block_size} "
+            f"(VLLM_BLOCK_SIZE request was {VLLM_BLOCK_SIZE})"
         )
         self.scheduler = Scheduler(
             vllm_config=self.vllm_config,
