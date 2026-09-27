@@ -22,10 +22,61 @@ from speculators.models.metrics import (
 )
 
 __all__ = [
+    "COUNTER_PREFIX",
+    "SLOT0_COUNTER_KEYS",
     "compute_metrics",
+    "eligible_anchor_token_count",
 ]
 
 _EPS = 1e-8
+
+# Additive counters, summed over micro-batches and then over ranks. The prefix is
+# the contract the trainer keys off: `_aggregate_metric_floats` MEANS every other
+# metric key, which is correct for a rate and wrong for a count, so these must be
+# recognisable without a per-key list on the trainer side.
+COUNTER_PREFIX = "ctr_"
+
+# Fixed, config-independent and ORDERED. The trainer reduces exactly this vector,
+# so it must not depend on what a local pack happened to produce -- a rank whose
+# key set differed would change the collective's shape and desync NCCL.
+SLOT0_COUNTER_KEYS = (
+    # Raw slot-0 agreement, pooled: the estimator the ACC log already reports.
+    f"{COUNTER_PREFIX}slot0_hit",            # h_i summed
+    f"{COUNTER_PREFIX}slot0_sampled",        # k_i summed
+    # Eligible positions per pack, i.e. the population each pack SAMPLED FROM.
+    f"{COUNTER_PREFIX}slot0_eligible",       # N_i summed
+    # Token-weighted estimator, as numerator/denominator so the ratio can be taken
+    # after both sums instead of averaging per-pack rates.
+    f"{COUNTER_PREFIX}slot0_tw_num",         # sum_i N_i * h_i / k_i
+    f"{COUNTER_PREFIX}slot0_tw_den",         # sum_i N_i  (only packs with k_i > 0)
+    # Packs excluded from the weighted estimator, so a reader can tell a small
+    # denominator from a silently dropped pack.
+    f"{COUNTER_PREFIX}slot0_packs",          # packs contributing
+    f"{COUNTER_PREFIX}slot0_packs_no_sample",  # k_i == 0
+    f"{COUNTER_PREFIX}slot0_packs_no_eligible",  # N_i == 0
+)
+
+
+def eligible_anchor_token_count(
+    loss_mask: torch.Tensor,  # [1, T]
+    block_size: int,
+) -> torch.Tensor:
+    """N_i: supervised positions a pack could have drawn an anchor from.
+
+    MUST match ``select_anchors`` (dflash/utils.py:43-44) exactly, which clears the
+    final ``block_size`` positions of the WHOLE PACKED ROW before sampling -- a
+    block anchored there would run past the end of the row. Counting plain
+    ``loss_mask.sum()`` instead would overstate the population by up to
+    ``block_size`` positions per pack and quietly bias the weighting.
+
+    This is the sampling POPULATION, not the sample: ``select_anchors`` then draws
+    ``min(max_anchors, N_i)`` of these without replacement.
+    """
+    if block_size <= 0:
+        raise ValueError(f"Expected block size > 0, got {block_size}")
+    valid = loss_mask.bool().clone()
+    valid[:, -block_size:] = False
+    return valid.sum().to(torch.float64)
 
 
 def _masked_decayed_mean(
@@ -53,6 +104,7 @@ def compute_metrics(
     gamma: float = 4.0,
     confidence_head_alpha: float = 1.0,
     sample_from_anchor: bool = True,
+    eligible_token_count: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
@@ -164,5 +216,51 @@ def compute_metrics(
     for pos in range(start_pos, block_size):
         metrics[f"position_{pos}_acc_sum"] = correct_per_pos[pos]
         metrics[f"position_{pos}_acc_total"] = total_per_pos[pos]
+
+    # ---- slot-0 teacher agreement, eligible-token weighted -------------------
+    # A DIAGNOSTIC ESTIMATOR, not a new training signal: every value below is
+    # detached, derived from tensors the loss already computed, and reported only.
+    # The loss, the sampling and every pre-existing metric are untouched.
+    #
+    # WHAT IT ESTIMATES. Each pack draws k_i anchors uniformly without replacement
+    # from its N_i eligible positions, so the pooled rate sum(h)/sum(k) weights a
+    # pack by how many anchors it happened to contribute, not by how much eligible
+    # text it holds. Re-weighting each pack's own rate h_i/k_i by N_i estimates the
+    # rate over eligible TOKENS instead:
+    #
+    #     sum_i N_i * (h_i / k_i)  /  sum_i N_i
+    #
+    # Both differ from serving acceptance, which is measured on served requests with
+    # its own boundaries and labels. This is NOT an acceptance rate and must not be
+    # relabelled as one.
+    #
+    # Emitted as numerator and denominator, never as a ratio: the trainer sums these
+    # over micro-batches and across ranks and divides ONCE at the end. Averaging
+    # per-pack ratios would silently re-weight by pack count.
+    if eligible_token_count is not None:
+        with torch.no_grad():
+            h_i = correct_per_pos[0].detach().to(torch.float64)
+            k_i = total_per_pos[0].detach().to(torch.float64)
+            n_i = eligible_token_count.detach().reshape(()).to(torch.float64)
+            zero = torch.zeros((), dtype=torch.float64, device=device)
+            one = torch.ones((), dtype=torch.float64, device=device)
+            # A pack with no sampled slot-0 anchor has NO estimate of its own rate,
+            # so it contributes to NEITHER side of the ratio. Adding its N_i to the
+            # denominator alone would drag the estimate toward zero; substituting the
+            # pooled rate would invent an observation. Both cases are counted so the
+            # exclusion is visible rather than inferred from a short denominator.
+            usable = (k_i > 0) & (n_i > 0)
+            metrics[SLOT0_COUNTER_KEYS[0]] = h_i
+            metrics[SLOT0_COUNTER_KEYS[1]] = k_i
+            metrics[SLOT0_COUNTER_KEYS[2]] = n_i
+            # clamp_min(1) only guards the DIVISION; the result is masked to 0 by
+            # `usable`, so a k_i of 0 never reaches the numerator as h_i/1.
+            metrics[SLOT0_COUNTER_KEYS[3]] = torch.where(
+                usable, n_i * h_i / k_i.clamp_min(1.0), zero
+            )
+            metrics[SLOT0_COUNTER_KEYS[4]] = torch.where(usable, n_i, zero)
+            metrics[SLOT0_COUNTER_KEYS[5]] = torch.where(usable, one, zero)
+            metrics[SLOT0_COUNTER_KEYS[6]] = torch.where(k_i > 0, zero, one)
+            metrics[SLOT0_COUNTER_KEYS[7]] = torch.where(n_i > 0, zero, one)
 
     return loss, metrics

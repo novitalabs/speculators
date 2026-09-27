@@ -1,12 +1,17 @@
 from typing import ClassVar
 
+import os
+
 import torch
 from transformers import PretrainedConfig
 
 from speculators.model import SpeculatorModel
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.config import DSparkSpeculatorConfig
-from speculators.models.dspark.metrics import compute_metrics
+from speculators.models.dspark.metrics import (
+    compute_metrics,
+    eligible_anchor_token_count,
+)
 from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
 from speculators.models.metrics import LossConfig, kl_div_loss, resolve_loss_config
 from speculators.models.utils import conditional_torch_compile
@@ -17,6 +22,46 @@ __all__ = [
     "DSparkDraftModel",
 ]
 
+
+
+
+# --- ANCHOR AUDIT (default OFF) -------------------------------------------
+# Read ONCE at import, never inside forward. `forward` is @conditional_torch_
+# compile'd, and the INTENT of a module-level Python bool is that Dynamo
+# specializes on it so the OFF build carries no runtime branch.
+#
+# MEASURED, on real GPU, at the TRAINING shape. eq0433 compared OFF/OFF2/ON on the
+# real compiled K3 forward in BOTH infer and train mode and found
+# n_off_vs_on_diff_fields=0 with identical draft_tokens_sha256, loss_hex and
+# rng_state_sha256 -- but only at seq_len=74, and its own verdict recorded
+# gate_authorises_50_steps=false because a short input does not cover the training
+# graph. mrep0926a then re-ran it at seq_len=32768 / max_anchors=96, train mode,
+# forward AND backward, on two real saved micro-batches (s1m0, s1m1):
+# verdict PASS, 0 differing fields, 0 same-arm instability,
+# gate_authorises_50_steps=true. Evidence:
+# diary-job/evidence/exp73-teacher/obs4/audit/{eq0433,mrep0926a}/.
+#
+# What that does NOT establish, per those verdicts' own `not_established` lists:
+# equivalence against a PRISTINE (unpatched) tree -- both arms run this same file,
+# OFF vs ON -- and generalisation to shapes other than the two measured. So the
+# claim is "OFF is bit-identical to ON at the training shape", not "the OFF build
+# is byte-identical to a build without this block".
+#
+# The static properties still hold and are still the reason the above is possible:
+# the flag is read at import, no os.environ read occurs inside forward (which would
+# force a graph break), and the audit block draws no RNG.
+#
+# Reading os.environ inside forward would force a graph break, which is why it
+# is not done here.
+#
+# The audit consumes NO RNG. select_anchors() draws an UNSEEDED torch.randperm
+# (dflash/utils.py:62), so any extra random draw here would shift every
+# subsequent anchor set and silently invalidate the comparison this instrument
+# exists to make. Everything below is argmax/gather/detach only.
+_ANCHOR_AUDIT = os.environ.get("CAMELOT_ANCHOR_AUDIT", "") == "1"
+# Reserved prefix: the trainer pops these BEFORE _metrics_to_float and they
+# never reach metric_parts, the loss, the aggregator or a checkpoint.
+AUDIT_PREFIX = "__audit__"
 
 @SpeculatorModel.register("dspark")
 class DSparkDraftModel(DFlashDraftModel):
@@ -175,6 +220,44 @@ class DSparkDraftModel(DFlashDraftModel):
             gamma=gamma,
             confidence_head_alpha=confidence_head_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
+            # N_i for the eligible-token-weighted slot-0 estimator. Computed from
+            # the ORIGINAL loss_mask, which is the only place the sampling
+            # population is still visible: aligned_loss_mask has already been
+            # gathered down to the k_i anchors that were actually drawn, so the
+            # population cannot be recovered from it.
+            eligible_token_count=eligible_anchor_token_count(
+                loss_mask, self.block_size
+            ),
         )
         draft_tokens = torch.argmax(logits, dim=-1)
+
+        if _ANCHOR_AUDIT:
+            # The REAL anchor trace, not an upper bound. `anchored_block_indices`
+            # is the exact [num_anchors*block_size] gather index the forward
+            # itself used, so slot k of block b is sequence position
+            # anchored_block_indices[b*block_size + k]. That is what makes this a
+            # replayable record: PACK-MAP could only bound which positions were
+            # ELIGIBLE (select_anchors additionally clears the last block_size
+            # positions and then samples), while this is the set actually taken.
+            #
+            # Everything is detach()ed and carried under AUDIT_PREFIX, which the
+            # trainer pops before metrics are floated/aggregated -- no audit
+            # value reaches the loss, the reported metrics or a checkpoint.
+            # draft_tokens/targets are already computed above; the argmax over
+            # targets duplicates dspark/metrics.py:158 exactly, so the audit adds
+            # no new numeric path, only a second read of existing tensors.
+            metrics[AUDIT_PREFIX + "anchor_idx"] = (
+                anchored_block_indices.detach().to(torch.int32)
+            )
+            metrics[AUDIT_PREFIX + "draft_argmax"] = draft_tokens.detach().view(-1)
+            metrics[AUDIT_PREFIX + "teacher_argmax"] = (
+                torch.argmax(targets, dim=-1).detach().view(-1)
+            )
+            metrics[AUDIT_PREFIX + "aligned_mask"] = (
+                aligned_loss_mask.detach().view(-1).to(torch.uint8)
+            )
+            metrics[AUDIT_PREFIX + "block_size"] = torch.tensor(
+                block, dtype=torch.int32, device=logits.device
+            )
+
         return draft_tokens, loss, metrics
