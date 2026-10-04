@@ -150,6 +150,12 @@ class DSparkDraftModel(DFlashDraftModel):
         gamma: float = 4.0,
         max_anchors: int = 3072,
         confidence_head_alpha: float = 1.0,
+        # Optional per-TOKEN loss multiplier, in the original packed coordinates.
+        # Declared explicitly rather than read out of **kwargs: kwargs is
+        # forwarded to _backbone_forward and on into the attention call, where an
+        # unexpected key would raise. None keeps the unweighted path, in which no
+        # statement below executes.
+        pos_weight: torch.Tensor | None = None,  # [1, total_seq_len]
         **kwargs,
     ):
         hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
@@ -210,6 +216,19 @@ class DSparkDraftModel(DFlashDraftModel):
                 1, mask_tokens_size
             )
 
+        # Align the per-token weight to the draft's slot layout with the SAME
+        # gather index the forward itself used, so no anchor-identity logic is
+        # duplicated here. Padded anchor blocks hold position 0 (select_anchors
+        # zero-initialises `anchors` and fills only [:k]), so those slots gather
+        # a REAL row's weight, not a zero -- they contribute nothing only because
+        # `aligned_loss_mask` has already been multiplied by `anchor_valid`
+        # (dflash/core.py), and the loss product is weight * mask * decay * term.
+        aligned_pos_weight = (
+            None
+            if pos_weight is None
+            else pos_weight[:, anchored_block_indices]  # [1, num_anchors*block]
+        )
+
         loss, metrics = compute_metrics(
             logits,
             targets,
@@ -228,6 +247,7 @@ class DSparkDraftModel(DFlashDraftModel):
             eligible_token_count=eligible_anchor_token_count(
                 loss_mask, self.block_size
             ),
+            loss_scale=aligned_pos_weight,
         )
         draft_tokens = torch.argmax(logits, dim=-1)
 

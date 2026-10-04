@@ -374,6 +374,7 @@ def compound_loss(
     pos_idx: torch.Tensor,
     loss_config: LossConfig,
     decay_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    loss_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute a weighted sum of loss terms.
 
@@ -384,13 +385,25 @@ def compound_loss(
     Returns the total loss and a dict of per-term (unweighted) scalar losses
     keyed as ``"{name}_loss"``.  When the config contains a single term the
     dict is empty (the overall loss already captures it).
+
+    ``loss_scale`` is an optional per-position multiplier applied inside every
+    term's NUMERATOR (see ``loss_function``). "Unweighted" above refers to the
+    ``loss_config`` term weights only: when ``loss_scale`` is given, the
+    reported per-term values carry it and are NOT comparable to a run without
+    it.
     """
     total = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
     term_losses: dict[str, torch.Tensor] = {}
     multi = len(loss_config) > 1
     for name, (fn, weight) in loss_config.items():
         term = loss_function(
-            logits, targets, loss_mask, pos_idx, loss_fn=fn, decay_fn=decay_fn
+            logits,
+            targets,
+            loss_mask,
+            pos_idx,
+            loss_fn=fn,
+            decay_fn=decay_fn,
+            loss_scale=loss_scale,
         )
         if multi:
             term_losses[f"{name}_loss"] = term.detach()
@@ -405,6 +418,7 @@ def loss_function(
     pos_idx: torch.Tensor,  # shape: [1, seq_len]
     loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = kl_div_loss,
     decay_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    loss_scale: torch.Tensor | None = None,  # shape: [1, seq_len]
 ):
     """Compute masked, optionally position-decayed training loss.
 
@@ -415,6 +429,15 @@ def loss_function(
         pos_idx: Position indices within each speculative block.
         loss_fn: Per-position loss function (default: kl_div_loss).
         decay_fn: Optional position-dependent decay weighting function.
+        loss_scale: Optional non-negative per-position multiplier, applied to
+            the NUMERATOR only, after the mask and the decay. The denominator
+            stays ``loss_mask.sum()``, i.e. the boolean supervised-slot count.
+            Folding the multiplier into ``loss_mask`` instead would put it in
+            the denominator too and the per-pack mean would normalise it away.
+            Cast to the elementwise loss dtype exactly as ``loss_mask`` and the
+            decay already are, so the only numerical change relative to
+            ``loss_scale=None`` is the multiplier itself -- no reduction dtype
+            is promoted here.
 
     Returns:
         Scalar mean loss across the batch.
@@ -428,6 +451,10 @@ def loss_function(
         decay_mult = decay_fn(pos_idx.to(elementwise_loss.dtype))
         elementwise_loss = elementwise_loss * decay_mult
 
+    if loss_scale is not None:
+        elementwise_loss = elementwise_loss * loss_scale.to(elementwise_loss.dtype)
+
+    # Boolean count, NOT reweighted: see the loss_scale note above.
     denominator = loss_mask.sum(dim=1) + _EPS
 
     batch_loss = torch.sum(elementwise_loss, dim=1) / denominator  # shape: [1]
