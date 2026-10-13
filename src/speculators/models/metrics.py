@@ -361,6 +361,7 @@ def compound_loss(
     pos_idx: torch.Tensor,
     loss_config: LossConfig,
     decay_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    loss_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute a weighted sum of loss terms.
 
@@ -377,7 +378,8 @@ def compound_loss(
     multi = len(loss_config) > 1
     for name, (fn, weight) in loss_config.items():
         term = loss_function(
-            logits, targets, loss_mask, pos_idx, loss_fn=fn, decay_fn=decay_fn
+            logits, targets, loss_mask, pos_idx, loss_fn=fn, decay_fn=decay_fn,
+            loss_scale=loss_scale,
         )
         if multi:
             term_losses[f"{name}_loss"] = term.detach()
@@ -392,6 +394,7 @@ def loss_function(
     pos_idx: torch.Tensor,  # shape: [1, seq_len]
     loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = kl_div_loss,
     decay_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    loss_scale: torch.Tensor | None = None,
 ):
     """Compute masked, optionally position-decayed training loss.
 
@@ -414,6 +417,9 @@ def loss_function(
     if decay_fn is not None:
         decay_mult = decay_fn(pos_idx.to(elementwise_loss.dtype))
         elementwise_loss = elementwise_loss * decay_mult
+
+    if loss_scale is not None:
+        elementwise_loss = elementwise_loss * loss_scale.to(elementwise_loss.dtype)
 
     denominator = loss_mask.sum(dim=1) + _EPS
 
