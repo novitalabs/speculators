@@ -105,6 +105,7 @@ class DSparkDraftModel(DFlashDraftModel):
         gamma: float = 4.0,
         max_anchors: int = 3072,
         confidence_head_alpha: float = 1.0,
+        pos_weight: torch.Tensor | None = None,
         **kwargs,
     ):
         hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
@@ -158,6 +159,9 @@ class DSparkDraftModel(DFlashDraftModel):
                 1, mask_tokens_size
             )
 
+        aligned_pos_weight = (
+            None if pos_weight is None else pos_weight[:, anchored_block_indices]
+        )
         loss, metrics = compute_metrics(
             logits,
             targets,
@@ -167,6 +171,7 @@ class DSparkDraftModel(DFlashDraftModel):
             loss_config=loss_config or _DEFAULT_LOSS_CONFIG,
             gamma=gamma,
             confidence_head_alpha=confidence_head_alpha,
+            loss_scale=aligned_pos_weight,
         )
         draft_tokens = torch.argmax(logits, dim=-1)
         return draft_tokens, loss, metrics

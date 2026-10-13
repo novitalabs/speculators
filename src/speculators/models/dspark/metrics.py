@@ -32,12 +32,15 @@ def _masked_decayed_mean(
     loss_mask: torch.Tensor,  # [1, T]
     pos_idx: torch.Tensor,  # [1, T]
     decay_fn: Callable[[torch.Tensor], torch.Tensor] | None,
+    loss_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Masked, optionally position-decayed mean of a precomputed per-position term."""
     loss_mask = loss_mask.to(elementwise.dtype)
     weighted = elementwise * loss_mask
     if decay_fn is not None:
         weighted = weighted * decay_fn(pos_idx.to(weighted.dtype))
+    if loss_scale is not None:
+        weighted = weighted * loss_scale.to(weighted.dtype)
     denominator = loss_mask.sum(dim=1) + _EPS
     return (weighted.sum(dim=1) / denominator).mean()
 
@@ -51,6 +54,7 @@ def compute_metrics(
     loss_config: LossConfig,
     gamma: float = 4.0,
     confidence_head_alpha: float = 1.0,
+    loss_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
@@ -60,7 +64,8 @@ def compute_metrics(
     decay_fn = partial(dflash_loss_decay, gamma=gamma)
 
     loss, term_losses = compound_loss(
-        logits, targets, loss_mask, pos_idx, loss_config=loss_config, decay_fn=decay_fn
+        logits, targets, loss_mask, pos_idx, loss_config=loss_config, decay_fn=decay_fn,
+        loss_scale=loss_scale,
     )
 
     # Analytical per-position acceptance rate = distributional overlap.
@@ -81,7 +86,7 @@ def compute_metrics(
         bce = binary_cross_entropy_with_logits(
             confidence_logits, c_star, reduction="none"
         )  # [1, T]
-        conf_loss = _masked_decayed_mean(bce, loss_mask, pos_idx, decay_fn)
+        conf_loss = _masked_decayed_mean(bce, loss_mask, pos_idx, decay_fn, loss_scale)
         loss = loss + confidence_head_alpha * conf_loss
 
         with torch.no_grad():
